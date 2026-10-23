@@ -111,8 +111,8 @@ async def handle_upload(request):
 
     caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
 
-    if player_url:
-        caption_lines.append(f"\n▶️ <a href=\"{player_url}\">Im Web-Player ansehen (inkl. Chat)</a>")
+    #if player_url:
+    #   caption_lines.append(f"\n▶️ <a href=\"{player_url}\">Im Web-Player ansehen (inkl. Chat)</a>")
 
     caption = "\n".join(caption_lines)
 
