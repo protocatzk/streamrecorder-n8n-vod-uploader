@@ -7,7 +7,9 @@ import uuid
 from datetime import datetime
 from aiohttp import web, ClientSession, ClientTimeout
 from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
+from fast_uploader import fast_upload_file, get_video_metadata
 
 # 1. Lade .env Datei falls vorhanden
 dotenv_file = find_dotenv(usecwd=True)
@@ -39,8 +41,9 @@ if not DEFAULT_CHAT_ID:
 # Maximale Dateigröße vor dem Aufteilen (1.8 GB) und Zielgröße pro Segment (1.4 GB für sicheren VBR-Puffer)
 SPLIT_THRESHOLD_BYTES = int(1.8 * 1024 * 1024 * 1024)   # 1.8 GB = 1.932.735.283 Bytes
 TARGET_PART_SIZE_BYTES = int(1.4 * 1024 * 1024 * 1024)  # 1.4 GB = 1.503.238.553 Bytes
+PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '6'))
 
-logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB)")
+logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS})")
 
 PLATFORM_ICONS = {
     'tiktok': '📱 TikTok',
@@ -109,27 +112,9 @@ def parse_duration_str(d_str: str) -> float | None:
     return None
 
 async def get_video_duration(file_path: str) -> float | None:
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        file_path
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
-            val = float(stdout.decode().strip())
-            if val > 0:
-                return val
-    except Exception as e:
-        logger.warning(f"ffprobe konnte Dauer von {file_path} nicht ermitteln: {e}")
-    return None
+    meta = await get_video_metadata(file_path)
+    dur = meta.get("duration", 0.0)
+    return dur if dur > 0 else None
 
 async def split_single_video(file_path: str, output_pattern: str, num_parts: int, duration_sec: float) -> list[str]:
     segment_time = duration_sec / num_parts
@@ -344,11 +329,12 @@ async def handle_upload(request):
                 caption = "\n".join(caption_lines)
                 upload_files.append((temp_video, caption))
 
-            # 4. Upload zu Telegram
+            # 4. Upload zu Telegram (Parallel Chunk-Upload mit Fallback)
             uploaded_message_ids = []
             for file_to_upload, file_caption in upload_files:
                 file_mb = round(os.path.getsize(file_to_upload) / (1024 * 1024), 1)
-                logger.info(f"[{job_id}] Sende {os.path.basename(file_to_upload)} ({file_mb} MB) zu Chat {chat_id}...")
+                filename = os.path.basename(file_to_upload)
+                logger.info(f"[{job_id}] Sende {filename} ({file_mb} MB) zu Chat {chat_id} (Parallele Worker: {PARALLEL_WORKERS})...")
 
                 last_reported_pct = -1
                 def make_progress_callback(f_name):
@@ -361,15 +347,49 @@ async def handle_upload(request):
                             logger.info(f"[{job_id}] Upload {f_name}: {last_reported_pct}% ({round(current/(1024*1024))} / {round(total/(1024*1024))} MB)")
                     return callback
 
-                msg = await state.telegram_client.send_file(
-                    entity=chat_id,
-                    file=file_to_upload,
-                    caption=file_caption,
-                    thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
-                    parse_mode='html',
-                    supports_streaming=True,
-                    progress_callback=make_progress_callback(os.path.basename(file_to_upload))
-                )
+                try:
+                    # Video-Attribute (Breite, Höhe, Dauer) für natives Telegram-Streaming auslesen
+                    v_meta = await get_video_metadata(file_to_upload)
+                    attributes = [
+                        DocumentAttributeVideo(
+                            duration=int(v_meta.get("duration") or 0),
+                            w=int(v_meta.get("width") or 1280),
+                            h=int(v_meta.get("height") or 720),
+                            supports_streaming=True
+                        ),
+                        DocumentAttributeFilename(file_name=filename)
+                    ]
+
+                    # Paralleler Upload der 512KB Chunks über mehrere MTProto-Verbindungen
+                    uploaded_handle = await fast_upload_file(
+                        client=state.telegram_client,
+                        file_path=file_to_upload,
+                        max_workers=PARALLEL_WORKERS,
+                        progress_callback=make_progress_callback(filename)
+                    )
+
+                    # Bereits hochgeladenen File-Handle mit Metadaten an den Chat senden
+                    msg = await state.telegram_client.send_file(
+                        entity=chat_id,
+                        file=uploaded_handle,
+                        caption=file_caption,
+                        thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
+                        attributes=attributes,
+                        parse_mode='html',
+                        supports_streaming=True
+                    )
+                except Exception as upload_err:
+                    logger.warning(f"[{job_id}] Paralleler Upload fehlgeschlagen ({upload_err}), starte sequentiellen Standard-Upload...", exc_info=True)
+                    msg = await state.telegram_client.send_file(
+                        entity=chat_id,
+                        file=file_to_upload,
+                        caption=file_caption,
+                        thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
+                        parse_mode='html',
+                        supports_streaming=True,
+                        progress_callback=make_progress_callback(filename)
+                    )
+
                 uploaded_message_ids.append(msg.id)
                 logger.info(f"[{job_id}] Upload erfolgreich! Message ID: {msg.id}")
 
@@ -430,6 +450,7 @@ async def handle_health(request):
         "queue_length": state.waiting_count,
         "split_threshold_mb": 1800,
         "target_part_size_mb": 1400,
+        "parallel_workers": PARALLEL_WORKERS,
         "chat_id": DEFAULT_CHAT_ID
     })
 
