@@ -5,3 +5,4 @@ streamrecorder.io.har
 *.session
 *.session-journal
 __pycache__/
+vod-uploader/mark_completed_from_logs.py
