@@ -35,13 +35,19 @@ if not DEFAULT_CHAT_ID:
 
 logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID})")
 
-async def download_video(url: str, output_path: str):
+PLATFORM_ICONS = {
+    'tiktok': '📱 TikTok',
+    'twitch': '🟣 Twitch',
+    'kick': '🟢 Kick',
+    'youtube': '🔴 YouTube'
+}
+
+async def download_file(url: str, output_path: str):
     logger.info(f"Starte Download von: {url[:80]}... nach {output_path}")
     async with ClientSession() as session:
         async with session.get(url) as response:
             if response.status != 200:
                 raise Exception(f"Download fehlgeschlagen mit HTTP {response.status}")
-            total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
             with open(output_path, 'wb') as f:
                 async for chunk in response.content.iter_chunked(2 * 1024 * 1024):  # 2MB Chunks
@@ -71,28 +77,68 @@ async def handle_upload(request):
     duration = data.get("duration", "N/A")
     filesize_mb = data.get("filesize_mb", "N/A")
     recording_id = data.get("recording_id", "")
+    thumbnail_url = data.get("thumbnail_url")
+    platform = data.get("platform", "").lower()
+    category = data.get("category", "")
+    max_viewers = data.get("max_viewers")
+    avg_viewers = data.get("avg_viewers")
+    deletion_time = data.get("deletion_time", "")
+    player_url = data.get("player_url", "")
 
-    caption = (
-        f"🎥 <b>Neues Stream-Recording</b>\n\n"
-        f"👤 <b>Streamer:</b> {streamer}\n"
-        f"📌 <b>Titel:</b> {title}\n"
-        f"⏱ <b>Dauer:</b> {duration}\n"
-        f"💾 <b>Größe:</b> {filesize_mb} MB\n"
-        f"🆔 <b>ID:</b><code> {recording_id}</code>"
-    )
+    # Schöne formatierte Caption zusammenbauen
+    platform_label = PLATFORM_ICONS.get(platform, f"🌐 {platform.capitalize() if platform else 'Stream'}")
+    
+    caption_lines = [
+        f"🎥 <b>Neues Stream-Recording</b>\n",
+        f"👤 <b>Streamer:</b> {streamer}",
+        f"📌 <b>Titel:</b> {title}"
+    ]
 
-    temp_filename = f"/tmp/stream_{recording_id or os.getpid()}.mp4"
+    if category:
+        caption_lines.append(f"🎮 <b>Kategorie:</b> {category} | {platform_label}")
+    else:
+        caption_lines.append(f"📡 <b>Plattform:</b> {platform_label}")
+
+    caption_lines.append("")
+    caption_lines.append(f"⏱ <b>Dauer:</b> {duration}")
+    caption_lines.append(f"💾 <b>Größe:</b> {filesize_mb} MB")
+
+    if max_viewers and max_viewers > 0:
+        caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
+
+    if deletion_time:
+        caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
+
+    caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
+
+    if player_url:
+        caption_lines.append(f"\n▶️ <a href=\"{player_url}\">Im Web-Player ansehen (inkl. Chat)</a>")
+
+    caption = "\n".join(caption_lines)
+
+    temp_video = f"/tmp/stream_{recording_id or os.getpid()}.mp4"
+    temp_thumb = f"/tmp/thumb_{recording_id or os.getpid()}.jpg" if thumbnail_url else None
 
     try:
-        # 1. Video herunterladen
-        await download_video(download_url, temp_filename)
+        # 1. Thumbnail parallel oder vorab laden, falls vorhanden
+        if thumbnail_url:
+            try:
+                await download_file(thumbnail_url, temp_thumb)
+                logger.info("Thumbnail erfolgreich heruntergeladen.")
+            except Exception as e:
+                logger.warning(f"Thumbnail konnte nicht geladen werden, fahre ohne fort: {e}")
+                temp_thumb = None
 
-        # 2. Upload via Telegram Client
-        logger.info(f"Starte Upload zu Chat {chat_id}...")
+        # 2. Video herunterladen
+        await download_file(download_url, temp_video)
+
+        # 3. Upload via Telegram Client (mit echtem Thumbnail)
+        logger.info(f"Starte Upload zu Chat {chat_id} mit Thumbnail={bool(temp_thumb)}...")
         message = await client.send_file(
             entity=chat_id,
-            file=temp_filename,
+            file=temp_video,
             caption=caption,
+            thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
             parse_mode='html',
             supports_streaming=True
         )
@@ -109,12 +155,14 @@ async def handle_upload(request):
         return web.json_response({"error": str(e)}, status=500)
 
     finally:
-        if os.path.exists(temp_filename):
-            try:
-                os.remove(temp_filename)
-                logger.info(f"Temporäre Datei {temp_filename} gelöscht.")
-            except Exception as e:
-                logger.warning(f"Konnte Temp-Datei nicht löschen: {e}")
+        # 4. Sauberes Aufräumen aller temporären Dateien
+        for temp_file in [temp_video, temp_thumb]:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                    logger.info(f"Temporäre Datei {temp_file} gelöscht.")
+                except Exception as e:
+                    logger.warning(f"Konnte Temp-Datei nicht löschen: {e}")
 
 async def handle_health(request):
     return web.json_response({
