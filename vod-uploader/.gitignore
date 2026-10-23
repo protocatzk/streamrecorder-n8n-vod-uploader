@@ -1,5 +1,6 @@
 .env
 .env.*
+!.env.example
 *.session
 *.session-journal
 __pycache__/
