@@ -275,11 +275,11 @@ async def handle_upload(request):
                 caption_lines.append(f"⏱ <b>Gesamtdauer:</b> {duration}")
                 caption_lines.append(f"💾 <b>Gesamtgröße:</b> {actual_size_mb} MB ({total_parts} Teile)")
 
-                if max_viewers and max_viewers > 0:
-                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
+#                if max_viewers and max_viewers > 0:
+#                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
 
-                if deletion_time:
-                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
+#                if deletion_time:
+#                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
 
                 caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
                 main_caption = "\n".join(caption_lines)
