@@ -4,6 +4,7 @@ import math
 import asyncio
 import logging
 import uuid
+from datetime import datetime
 from aiohttp import web, ClientSession, ClientTimeout
 from telethon import TelegramClient
 from dotenv import load_dotenv, find_dotenv
@@ -78,6 +79,21 @@ async def download_file(url: str, output_path: str):
                         logger.info(f"Download Fortschritt: {round(downloaded / (1024*1024))} MB{pct}")
                         
             logger.info(f"Download fertig: {downloaded} Bytes heruntergeladen ({round(downloaded/1024/1024, 1)} MB).")
+
+def format_recorded_at(date_str: str | None) -> str | None:
+    if not date_str or str(date_str).strip() in ("", "N/A", "None"):
+        return None
+    try:
+        cleaned = str(date_str).replace('Z', '').split('+')[0].strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(cleaned, fmt)
+                return dt.strftime("%d.%m.%Y, %H:%M Uhr")
+            except ValueError:
+                pass
+        return str(date_str)
+    except Exception:
+        return str(date_str)
 
 def parse_duration_str(d_str: str) -> float | None:
     if not d_str or d_str == "N/A":
@@ -221,6 +237,8 @@ async def handle_upload(request):
             max_viewers = data.get("max_viewers")
             avg_viewers = data.get("avg_viewers")
             deletion_time = data.get("deletion_time", "")
+            recorded_at = data.get("recorded_at", "")
+            formatted_date = format_recorded_at(recorded_at)
 
             # 1. Thumbnail parallel/vorab laden
             if thumbnail_url:
@@ -272,6 +290,8 @@ async def handle_upload(request):
                     caption_lines.append(f"📡 <b>Plattform:</b> {platform_label}")
 
                 caption_lines.append("")
+                if formatted_date:
+                    caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
                 caption_lines.append(f"⏱ <b>Gesamtdauer:</b> {duration}")
                 caption_lines.append(f"💾 <b>Gesamtgröße:</b> {actual_size_mb} MB ({total_parts} Teile)")
 
@@ -287,12 +307,15 @@ async def handle_upload(request):
 
                 # Teil 2..N nummeriert
                 for idx, part_path in enumerate(split_parts[1:], start=2):
-                    sub_caption = (
-                        f"🎥 <b>Neues Stream-Recording (Teil {idx}/{total_parts})</b>\n\n"
-                        f"👤 <b>Streamer:</b> {streamer}\n"
-                        f"📌 <b>Titel:</b> {title}\n"
-                        f"🆔 <b>ID:</b> <code>{recording_id}</code>"
-                    )
+                    sub_caption_lines = [
+                        f"🎥 <b>Neues Stream-Recording (Teil {idx}/{total_parts})</b>\n",
+                        f"👤 <b>Streamer:</b> {streamer}",
+                        f"📌 <b>Titel:</b> {title}"
+                    ]
+                    if formatted_date:
+                        sub_caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
+                    sub_caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
+                    sub_caption = "\n".join(sub_caption_lines)
                     upload_files.append((part_path, sub_caption))
             else:
                 caption_lines = [
@@ -306,14 +329,16 @@ async def handle_upload(request):
                     caption_lines.append(f"📡 <b>Plattform:</b> {platform_label}")
 
                 caption_lines.append("")
+                if formatted_date:
+                    caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
                 caption_lines.append(f"⏱ <b>Dauer:</b> {duration}")
                 caption_lines.append(f"💾 <b>Größe:</b> {filesize_mb} MB")
 
-                if max_viewers and max_viewers > 0:
-                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
+#                if max_viewers and max_viewers > 0:
+#                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
 
-                if deletion_time:
-                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
+#                if deletion_time:
+#                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
 
                 caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
                 caption = "\n".join(caption_lines)
@@ -347,6 +372,22 @@ async def handle_upload(request):
                 )
                 uploaded_message_ids.append(msg.id)
                 logger.info(f"[{job_id}] Upload erfolgreich! Message ID: {msg.id}")
+
+            # 5. Direkt auf Streamrecorder als 'downloaded' markieren (falls Cookie vorhanden)
+            sr_cookie = data.get("cookie") or os.getenv("STREAMRECORDER_COOKIE")
+            if sr_cookie and recording_id:
+                try:
+                    mark_url = f"https://streamrecorder.io/api/user/setdownloaded?fileid={recording_id}"
+                    headers = {
+                        "Cookie": sr_cookie,
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    }
+                    timeout = ClientTimeout(total=15)
+                    async with ClientSession(timeout=timeout) as session:
+                        async with session.get(mark_url, headers=headers) as mark_resp:
+                            logger.info(f"[{job_id}] Streamrecorder Auto-Mark: HTTP {mark_resp.status}")
+                except Exception as e:
+                    logger.warning(f"[{job_id}] Konnte Streamrecorder nicht als downloaded markieren: {e}")
 
             return web.json_response({
                 "status": "success",
