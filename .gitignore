@@ -1,0 +1,6 @@
+streamrecorder.io.har
+.env
+.env.*
+*.session
+*.session-journal
+__pycache__/
