@@ -109,12 +109,12 @@ class TopicManager:
             self.cache[chat_key] = {}
 
         normalized_title = title.strip()
+        lookup_key = normalized_title.lower()
 
         # 1. Smart-Matching im lokalen Cache
         matched_topic_id = self.find_cached_topic(chat_key, normalized_title)
         if matched_topic_id:
             # Schnelleres Wiederfinden für die Zukunft: Alias eintragen
-            lookup_key = normalized_title.lower()
             if lookup_key not in self.cache[chat_key]:
                 self.cache[chat_key][lookup_key] = matched_topic_id
                 self._save_cache()
@@ -160,6 +160,8 @@ class TopicManager:
 
         logger.info(f"Neues Forum-Topic '{clean_title}' erfolgreich erstellt mit ID {topic_id}.")
         self.cache[chat_key][lookup_key] = topic_id
+        if lookup_key.startswith('@'):
+            self.cache[chat_key][lookup_key[1:]] = topic_id
         self._save_cache()
         return topic_id
 

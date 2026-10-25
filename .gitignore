@@ -6,3 +6,4 @@ streamrecorder.io.har
 *.session-journal
 __pycache__/
 vod-uploader/mark_completed_from_logs.py
+vod-uploader/topics_cache.json
