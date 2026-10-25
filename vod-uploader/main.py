@@ -1,6 +1,8 @@
 import os
+import re
 import glob
 import math
+import shutil
 import asyncio
 import logging
 import uuid
@@ -9,7 +11,8 @@ from aiohttp import web, ClientSession, ClientTimeout
 from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
-from fast_uploader import fast_upload_file, get_video_metadata
+from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_to_seconds
+from topic_manager import topic_manager
 
 # 1. Lade .env Datei falls vorhanden
 dotenv_file = find_dotenv(usecwd=True)
@@ -38,12 +41,15 @@ DEFAULT_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 if not DEFAULT_CHAT_ID:
     raise ValueError("TELEGRAM_CHAT_ID Umgebungsvariable oder in .env fehlt!")
 
+DEFAULT_FORUM_CHAT_ID = os.getenv('TELEGRAM_FORUM_CHAT_ID')
+FORWARD_DROP_AUTHOR = os.getenv('FORWARD_DROP_AUTHOR', 'true').lower() in ('true', '1', 'yes')
+
 # Maximale Dateigröße vor dem Aufteilen (1.8 GB) und Zielgröße pro Segment (1.4 GB für sicheren VBR-Puffer)
 SPLIT_THRESHOLD_BYTES = int(1.8 * 1024 * 1024 * 1024)   # 1.8 GB = 1.932.735.283 Bytes
 TARGET_PART_SIZE_BYTES = int(1.4 * 1024 * 1024 * 1024)  # 1.4 GB = 1.503.238.553 Bytes
 PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '6'))
 
-logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS})")
+logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS})")
 
 PLATFORM_ICONS = {
     'tiktok': '📱 TikTok',
@@ -83,6 +89,20 @@ async def download_file(url: str, output_path: str):
                         
             logger.info(f"Download fertig: {downloaded} Bytes heruntergeladen ({round(downloaded/1024/1024, 1)} MB).")
 
+def sanitize_cookie(raw_cookie: str | None) -> str | None:
+    if not raw_cookie:
+        return None
+    cookie_str = str(raw_cookie).strip()
+    if cookie_str.lower().startswith("cookie:"):
+        cookie_str = cookie_str[7:].strip()
+    # Ersetze CRLF und Zeilenumbrüche durch Semikolon-Trennung für gültiges Cookie-Header-Format
+    cookie_str = re.sub(r'[\r\n]+', '; ', cookie_str)
+    # Entferne verbleibende ASCII-Steuerzeichen (< 32 und 127)
+    cookie_str = re.sub(r'[\x00-\x1f\x7f]', '', cookie_str).strip()
+    # Mehrfache Semikolons/Leerzeichen bereinigen
+    cookie_str = re.sub(r';\s*;+', ';', cookie_str).strip('; ')
+    return cookie_str if cookie_str else None
+
 def format_recorded_at(date_str: str | None) -> str | None:
     if not date_str or str(date_str).strip() in ("", "N/A", "None"):
         return None
@@ -116,8 +136,12 @@ async def get_video_duration(file_path: str) -> float | None:
     dur = meta.get("duration", 0.0)
     return dur if dur > 0 else None
 
-async def split_single_video(file_path: str, output_pattern: str, num_parts: int, duration_sec: float) -> list[str]:
-    segment_time = duration_sec / num_parts
+async def run_ffmpeg_segment(
+    file_path: str,
+    output_pattern: str,
+    segment_time: float,
+    job_id: str
+) -> list[str]:
     cmd = [
         "ffmpeg",
         "-y",
@@ -129,7 +153,7 @@ async def split_single_video(file_path: str, output_pattern: str, num_parts: int
         "-reset_timestamps", "1",
         output_pattern
     ]
-    logger.info(f"Starte ffmpeg-Splitting in {num_parts} Teile (je ~{segment_time:.1f}s)...")
+    logger.info(f"[{job_id}] Starte ffmpeg-Segmentierung mit segment_time={segment_time:.1f}s...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -138,47 +162,115 @@ async def split_single_video(file_path: str, output_pattern: str, num_parts: int
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
         err_msg = stderr.decode('utf-8', errors='ignore')
-        logger.error(f"ffmpeg-Fehler: {err_msg}")
+        logger.error(f"[{job_id}] ffmpeg-Fehler: {err_msg}")
         raise Exception(f"Video-Aufteilung fehlgeschlagen: {err_msg[:200]}")
     
     glob_pattern = output_pattern.replace("%03d", "*")
     parts = sorted(glob.glob(glob_pattern))
-    if not parts:
-        raise Exception("ffmpeg erzeugte keine Part-Dateien!")
     return parts
 
-async def ensure_split_parts_under_limit(initial_parts: list[str], job_id: str) -> list[str]:
-    """Prüft rekursiv, dass absolut JEDER Part unter SPLIT_THRESHOLD_BYTES (1.8 GB) liegt."""
-    final_parts = []
-    sub_counter = 0
+async def split_video_to_parts(
+    input_file: str,
+    job_dir: str,
+    job_id: str,
+    initial_duration: float | None = None
+) -> list[str]:
+    """
+    Teilt ein Video deterministisch und robust so auf, dass JEDER resultierende Teil
+    garantiert unter SPLIT_THRESHOLD_BYTES (1.8 GB) liegt.
+    Verwendet eine iterative Queue mit isolierten Unterordnern pro Split-Schritt,
+    um Namenskollisionen, unvollständige Splits und Endlosschleifen auszuschließen.
+    """
+    total_size = os.path.getsize(input_file)
+    if total_size <= SPLIT_THRESHOLD_BYTES:
+        return [input_file]
 
-    for part_path in initial_parts:
-        part_size = os.path.getsize(part_path)
-        if part_size <= SPLIT_THRESHOLD_BYTES:
-            final_parts.append(part_path)
-        else:
-            part_mb = round(part_size / (1024 * 1024), 1)
-            logger.warning(f"[{job_id}] Part {part_path} ({part_mb} MB) überschreitet trotz Splitting 1.8 GB (VBR-Spitze)! Teile erneut auf...")
-            
-            part_dur = await get_video_duration(part_path)
-            if not part_dur:
-                part_dur = 1800  # Fallback
-            
-            sub_count = max(2, math.ceil(part_size / TARGET_PART_SIZE_BYTES))
-            sub_pattern = f"/tmp/subpart_{job_id}_{sub_counter}_%03d.mp4"
-            sub_counter += 1
-            
-            sub_parts = await split_single_video(part_path, sub_pattern, sub_count, part_dur)
-            verified_subs = await ensure_split_parts_under_limit(sub_parts, job_id)
-            final_parts.extend(verified_subs)
-            
-            # Überflüssigen großen Zwischen-Part löschen
+    queue = [input_file]
+    verified_parts: list[str] = []
+    split_step = 0
+    max_total_steps = 40
+
+    while queue and split_step < max_total_steps:
+        current_file = queue.pop(0)
+
+        if not os.path.exists(current_file):
+            logger.warning(f"[{job_id}] Teil nicht gefunden: {current_file}, überspringe...")
+            continue
+
+        current_size = os.path.getsize(current_file)
+        if current_size <= SPLIT_THRESHOLD_BYTES:
+            verified_parts.append(current_file)
+            continue
+
+        split_step += 1
+        current_mb = round(current_size / (1024 * 1024), 1)
+        logger.info(f"[{job_id}] Datei/Teil {os.path.basename(current_file)} ({current_mb} MB) überschreitet 1.8 GB Limit (Schritt {split_step})...")
+
+        part_dur = await get_video_duration(current_file)
+        if not part_dur or part_dur <= 0:
+            if current_file == input_file and initial_duration and initial_duration > 0:
+                part_dur = initial_duration
+            else:
+                estimated_sec = (current_size * 8) / (3 * 1024 * 1024)
+                part_dur = max(60.0, estimated_sec)
+                logger.info(f"[{job_id}] Dauer nicht direkt lesbar, geschätzt: ~{part_dur:.1f}s")
+
+        sub_count = max(2, math.ceil(current_size / TARGET_PART_SIZE_BYTES))
+        segment_time = part_dur / sub_count
+
+        step_dir = os.path.join(job_dir, f"split_step_{split_step}")
+        os.makedirs(step_dir, exist_ok=True)
+        output_pattern = os.path.join(step_dir, "part_%03d.mp4")
+
+        # Versuche ffmpeg-Segmentierung. Falls nur 1 Teil erzeugt wird (weil segment_time >= tatsächliche Dauer),
+        # halbiere segment_time adaptiv (bis zu 4 Versuche)
+        new_parts = []
+        attempt = 0
+        current_seg_time = segment_time
+
+        while attempt < 4:
+            attempt += 1
+            new_parts = await run_ffmpeg_segment(current_file, output_pattern, current_seg_time, job_id)
+
+            if len(new_parts) > 1:
+                break
+
+            logger.warning(
+                f"[{job_id}] ffmpeg erzeugte nur {len(new_parts)} Teil(e) mit segment_time={current_seg_time:.1f}s. "
+                f"Halbiere segment_time für Versuch {attempt + 1}..."
+            )
+
+            for p in new_parts:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+            current_seg_time = max(30.0, current_seg_time / 2)
+
+        if len(new_parts) <= 1:
+            logger.error(f"[{job_id}] Konnte Teil {current_file} trotz mehrerer Versuche nicht aufteilen!")
+            if new_parts:
+                verified_parts.extend(new_parts)
+            else:
+                verified_parts.append(current_file)
+            continue
+
+        # Lösche die übergeordnete Zwischendatei (wenn es nicht die originale input_file ist)
+        if current_file != input_file:
             try:
-                os.remove(part_path)
-            except Exception:
-                pass
+                os.remove(current_file)
+            except Exception as e:
+                logger.warning(f"[{job_id}] Konnte temporäre Zwischendatei {current_file} nicht löschen: {e}")
 
-    return final_parts
+        # Neue Teile vorne in die Queue einfügen, um die chronologische Reihenfolge zu bewahren
+        queue = new_parts + queue
+
+    if split_step >= max_total_steps and queue:
+        logger.warning(f"[{job_id}] Maximale Split-Schritte ({max_total_steps}) erreicht! Verbleibende Queue wird übernommen.")
+        verified_parts.extend(queue)
+
+    return verified_parts
 
 async def handle_upload(request):
     try:
@@ -199,8 +291,10 @@ async def handle_upload(request):
     in_queue = True
     logger.info(f"[{job_id}] Request eingereiht ({streamer} - '{title}'). Wartende Jobs: {state.waiting_count}.")
 
-    temp_video = f"/tmp/stream_{job_id}.mp4"
-    temp_thumb = f"/tmp/thumb_{job_id}.jpg" if data.get("thumbnail_url") else None
+    job_dir = f"/tmp/job_{job_id}"
+    os.makedirs(job_dir, exist_ok=True)
+    temp_video = os.path.join(job_dir, f"stream_{job_id}.mp4")
+    temp_thumb = os.path.join(job_dir, f"thumb_{job_id}.jpg") if data.get("thumbnail_url") else None
 
     try:
         async with state.upload_lock:
@@ -214,6 +308,14 @@ async def handle_upload(request):
             except ValueError:
                 chat_id = raw_chat_id
 
+            raw_forum_chat_id = data.get("forum_chat_id", DEFAULT_FORUM_CHAT_ID)
+            forum_chat_id = None
+            if raw_forum_chat_id:
+                try:
+                    forum_chat_id = int(raw_forum_chat_id)
+                except ValueError:
+                    forum_chat_id = raw_forum_chat_id
+
             duration = data.get("duration", "N/A")
             filesize_mb = data.get("filesize_mb", "N/A")
             thumbnail_url = data.get("thumbnail_url")
@@ -225,7 +327,7 @@ async def handle_upload(request):
             recorded_at = data.get("recorded_at", "")
             formatted_date = format_recorded_at(recorded_at)
 
-            # 1. Thumbnail parallel/vorab laden
+            # 1. Thumbnail vorab laden
             if thumbnail_url:
                 try:
                     await download_file(thumbnail_url, temp_thumb)
@@ -242,24 +344,16 @@ async def handle_upload(request):
             logger.info(f"[{job_id}] Download abgeschlossen. Tatsächliche Größe: {actual_size_mb} MB")
 
             platform_label = PLATFORM_ICONS.get(platform, f"🌐 {platform.capitalize() if platform else 'Stream'}")
-            upload_files = []
+            clean_streamer = "".join(c for c in streamer if c.isalnum() or c in ('_', '-')).strip() or "stream"
+            upload_files: list[tuple[str, str, str]] = []  # (file_path, caption, display_filename)
 
             # 3. Prüfen ob Aufteilung nötig (> 1.8 GB)
             if actual_size > SPLIT_THRESHOLD_BYTES:
-                num_parts = max(2, math.ceil(actual_size / TARGET_PART_SIZE_BYTES))
-                logger.info(f"[{job_id}] Datei ({actual_size_mb} MB) überschreitet 1.8 GB! Initiale Aufteilung in {num_parts} Teile (Zielgröße: {round(TARGET_PART_SIZE_BYTES/(1024*1024))} MB/Teil)...")
-
                 duration_sec = await get_video_duration(temp_video)
                 if not duration_sec:
-                    duration_sec = parse_duration_str(duration)
-                if not duration_sec:
-                    duration_sec = num_parts * 900  # Fallback
+                    duration_sec = parse_duration_to_seconds(duration)
 
-                initial_pattern = f"/tmp/part_{job_id}_%03d.mp4"
-                initial_parts = await split_single_video(temp_video, initial_pattern, num_parts, duration_sec)
-                
-                # Rekursive Größenprüfung garantiert, dass kein Part über 1.8 GB liegt
-                split_parts = await ensure_split_parts_under_limit(initial_parts, job_id)
+                split_parts = await split_video_to_parts(temp_video, job_dir, job_id, initial_duration=duration_sec)
                 total_parts = len(split_parts)
                 logger.info(f"[{job_id}] Finale Anzahl geprüfter Video-Teile: {total_parts}")
 
@@ -279,16 +373,10 @@ async def handle_upload(request):
                     caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
                 caption_lines.append(f"⏱ <b>Gesamtdauer:</b> {duration}")
                 caption_lines.append(f"💾 <b>Gesamtgröße:</b> {actual_size_mb} MB ({total_parts} Teile)")
-
-#                if max_viewers and max_viewers > 0:
-#                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
-
-#                if deletion_time:
-#                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
-
                 caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
                 main_caption = "\n".join(caption_lines)
-                upload_files.append((split_parts[0], main_caption))
+                display_filename_1 = f"{clean_streamer}_{job_id}_part01.mp4"
+                upload_files.append((split_parts[0], main_caption, display_filename_1))
 
                 # Teil 2..N nummeriert
                 for idx, part_path in enumerate(split_parts[1:], start=2):
@@ -301,7 +389,8 @@ async def handle_upload(request):
                         sub_caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
                     sub_caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
                     sub_caption = "\n".join(sub_caption_lines)
-                    upload_files.append((part_path, sub_caption))
+                    display_filename_n = f"{clean_streamer}_{job_id}_part{idx:02d}.mp4"
+                    upload_files.append((part_path, sub_caption, display_filename_n))
             else:
                 caption_lines = [
                     f"🎥 <b>Neues Stream-Recording</b>\n",
@@ -317,24 +406,17 @@ async def handle_upload(request):
                 if formatted_date:
                     caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
                 caption_lines.append(f"⏱ <b>Dauer:</b> {duration}")
-                caption_lines.append(f"💾 <b>Größe:</b> {filesize_mb} MB")
-
-#                if max_viewers and max_viewers > 0:
-#                    caption_lines.append(f"👥 <b>Zuschauer:</b> Peak: {max_viewers:,} | Ø {avg_viewers:,}".replace(',', '.'))
-
-#                if deletion_time:
-#                    caption_lines.append(f"⏳ <b>Cloud-Speicher:</b> noch {deletion_time}")
-
+                caption_lines.append(f"💾 <b>Größe:</b> {actual_size_mb} MB")
                 caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
                 caption = "\n".join(caption_lines)
-                upload_files.append((temp_video, caption))
+                display_filename_single = f"{clean_streamer}_{job_id}.mp4"
+                upload_files.append((temp_video, caption, display_filename_single))
 
             # 4. Upload zu Telegram (Parallel Chunk-Upload mit Fallback)
             uploaded_message_ids = []
-            for file_to_upload, file_caption in upload_files:
+            for file_to_upload, file_caption, display_filename in upload_files:
                 file_mb = round(os.path.getsize(file_to_upload) / (1024 * 1024), 1)
-                filename = os.path.basename(file_to_upload)
-                logger.info(f"[{job_id}] Sende {filename} ({file_mb} MB) zu Chat {chat_id} (Parallele Worker: {PARALLEL_WORKERS})...")
+                logger.info(f"[{job_id}] Sende {display_filename} ({file_mb} MB) zu Chat {chat_id} (Parallele Worker: {PARALLEL_WORKERS})...")
 
                 last_reported_pct = -1
                 def make_progress_callback(f_name):
@@ -357,7 +439,7 @@ async def handle_upload(request):
                             h=int(v_meta.get("height") or 720),
                             supports_streaming=True
                         ),
-                        DocumentAttributeFilename(file_name=filename)
+                        DocumentAttributeFilename(file_name=display_filename)
                     ]
 
                     # Paralleler Upload der 512KB Chunks über mehrere MTProto-Verbindungen
@@ -365,7 +447,7 @@ async def handle_upload(request):
                         client=state.telegram_client,
                         file_path=file_to_upload,
                         max_workers=PARALLEL_WORKERS,
-                        progress_callback=make_progress_callback(filename)
+                        progress_callback=make_progress_callback(display_filename)
                     )
 
                     # Bereits hochgeladenen File-Handle mit Metadaten an den Chat senden
@@ -387,14 +469,38 @@ async def handle_upload(request):
                         thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
                         parse_mode='html',
                         supports_streaming=True,
-                        progress_callback=make_progress_callback(filename)
+                        progress_callback=make_progress_callback(display_filename)
                     )
 
                 uploaded_message_ids.append(msg.id)
                 logger.info(f"[{job_id}] Upload erfolgreich! Message ID: {msg.id}")
 
+            # 4b. Weiterleiten in Forum-Supergruppe und Topic-Sortierung (falls konfiguriert)
+            forum_message_ids = []
+            target_topic_id = None
+            if forum_chat_id and uploaded_message_ids:
+                try:
+                    topic_title = data.get("topic_name") or streamer or "Allgemein"
+                    target_topic_id = await topic_manager.get_or_create_topic(
+                        client=state.telegram_client,
+                        forum_chat_id=forum_chat_id,
+                        title=topic_title
+                    )
+                    forum_message_ids = await topic_manager.forward_messages_to_topic(
+                        client=state.telegram_client,
+                        from_chat=chat_id,
+                        to_forum_chat=forum_chat_id,
+                        message_ids=uploaded_message_ids,
+                        topic_id=target_topic_id,
+                        drop_author=FORWARD_DROP_AUTHOR
+                    )
+                    logger.info(f"[{job_id}] Video-Nachricht(en) erfolgreich in Forum {forum_chat_id} (Topic '{topic_title}' [ID {target_topic_id}]) weitergeleitet.")
+                except Exception as fwd_err:
+                    logger.error(f"[{job_id}] Fehler beim Weiterleiten in Forum-Topic: {fwd_err}", exc_info=True)
+
             # 5. Direkt auf Streamrecorder als 'downloaded' markieren (falls Cookie vorhanden)
-            sr_cookie = data.get("cookie") or os.getenv("STREAMRECORDER_COOKIE")
+            raw_cookie = data.get("cookie") or os.getenv("STREAMRECORDER_COOKIE")
+            sr_cookie = sanitize_cookie(raw_cookie)
             if sr_cookie and recording_id:
                 try:
                     mark_url = f"https://streamrecorder.io/api/user/setdownloaded?fileid={recording_id}"
@@ -405,7 +511,8 @@ async def handle_upload(request):
                     timeout = ClientTimeout(total=15)
                     async with ClientSession(timeout=timeout) as session:
                         async with session.get(mark_url, headers=headers) as mark_resp:
-                            logger.info(f"[{job_id}] Streamrecorder Auto-Mark: HTTP {mark_resp.status}")
+                            resp_text = await mark_resp.text()
+                            logger.info(f"[{job_id}] Streamrecorder Auto-Mark: HTTP {mark_resp.status} (Antwort: {resp_text[:100]})")
                 except Exception as e:
                     logger.warning(f"[{job_id}] Konnte Streamrecorder nicht als downloaded markieren: {e}")
 
@@ -414,7 +521,10 @@ async def handle_upload(request):
                 "message_id": uploaded_message_ids[0],
                 "message_ids": uploaded_message_ids,
                 "parts": len(uploaded_message_ids),
-                "chat_id": chat_id
+                "chat_id": chat_id,
+                "forum_chat_id": forum_chat_id,
+                "topic_id": target_topic_id,
+                "forwarded_message_ids": forum_message_ids
             })
 
     except Exception as e:
@@ -425,21 +535,14 @@ async def handle_upload(request):
         if in_queue:
             state.waiting_count -= 1
 
-        # 5. Sauberes Aufräumen aller temporären Dateien
-        for p in glob.glob(f"/tmp/*part_{job_id}_*.mp4"):
-            try:
-                os.remove(p)
-                logger.info(f"[{job_id}] Temporäre Part-Datei gelöscht: {p}")
-            except Exception as e:
-                logger.warning(f"[{job_id}] Konnte Part-Datei {p} nicht löschen: {e}")
+        # 6. Sauberes Aufräumen des gesamten Job-Verzeichnisses
+        try:
+            if os.path.exists(job_dir):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                logger.info(f"[{job_id}] Temporäres Job-Verzeichnis gelöscht: {job_dir}")
+        except Exception as e:
+            logger.warning(f"[{job_id}] Konnte Job-Verzeichnis {job_dir} nicht löschen: {e}")
 
-        for temp_file in [temp_video, temp_thumb]:
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                    logger.info(f"[{job_id}] Temporäre Datei gelöscht: {temp_file}")
-                except Exception as e:
-                    logger.warning(f"[{job_id}] Konnte Temp-Datei nicht löschen: {e}")
 
 async def handle_health(request):
     is_busy = state.upload_lock.locked()
@@ -451,7 +554,9 @@ async def handle_health(request):
         "split_threshold_mb": 1800,
         "target_part_size_mb": 1400,
         "parallel_workers": PARALLEL_WORKERS,
-        "chat_id": DEFAULT_CHAT_ID
+        "chat_id": DEFAULT_CHAT_ID,
+        "forum_chat_id": DEFAULT_FORUM_CHAT_ID,
+        "forward_drop_author": FORWARD_DROP_AUTHOR
     })
 
 async def on_startup(app):

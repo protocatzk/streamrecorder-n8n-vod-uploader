@@ -173,13 +173,37 @@ async def fast_upload_file(
         raise e
 
 
+def parse_duration_to_seconds(d_val) -> float | None:
+    if not d_val:
+        return None
+    d_str = str(d_val).strip()
+    if d_str in ("", "N/A", "None"):
+        return None
+    try:
+        val = float(d_str)
+        if val > 0:
+            return val
+    except ValueError:
+        pass
+    
+    try:
+        parts = [float(p) for p in d_str.split(':')]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        elif len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+    except Exception:
+        pass
+    return None
+
+
 async def get_video_metadata(file_path: str) -> dict:
     """Extrahiert Breite, Höhe und Dauer des Videos via ffprobe für optimales Telegram-Streaming."""
     cmd = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,duration:format=duration",
+        "-show_entries", "stream=width,height,duration,r_frame_rate,avg_frame_rate,nb_frames:stream_tags=DURATION,DURATION-eng:format=duration",
         "-of", "json",
         file_path
     ]
@@ -201,22 +225,47 @@ async def get_video_metadata(file_path: str) -> dict:
                 s0 = streams[0]
                 width = int(s0.get("width") or width)
                 height = int(s0.get("height") or height)
+                
+                # 1. Video-Stream Dauer direkt
                 if s0.get("duration"):
+                    dur = parse_duration_to_seconds(s0["duration"])
+                    if dur and dur > 0:
+                        duration = dur
+
+                # 2. Aus Stream-Tags (z.B. Matroska/MP4 DURATION Tag)
+                if duration <= 0:
+                    tags = s0.get("tags") or {}
+                    tag_dur = tags.get("DURATION") or tags.get("DURATION-eng")
+                    if tag_dur:
+                        dur = parse_duration_to_seconds(tag_dur)
+                        if dur and dur > 0:
+                            duration = dur
+
+                # 3. Aus Frame-Count und Frame-Rate falls vorhanden
+                if duration <= 0 and s0.get("nb_frames"):
                     try:
-                        duration = float(s0["duration"])
-                    except (ValueError, TypeError):
+                        nb_f = int(s0["nb_frames"])
+                        r_fps = s0.get("r_frame_rate") or s0.get("avg_frame_rate")
+                        if r_fps and "/" in r_fps:
+                            num, den = map(float, r_fps.split("/"))
+                            if den > 0:
+                                fps = num / den
+                                if fps > 0 and nb_f > 0:
+                                    duration = nb_f / fps
+                    except Exception:
                         pass
 
+            # 4. Fallback auf Container-Format Dauer
             if duration <= 0:
                 format_info = data.get("format", {})
                 if format_info.get("duration"):
-                    try:
-                        duration = float(format_info["duration"])
-                    except (ValueError, TypeError):
-                        pass
+                    dur = parse_duration_to_seconds(format_info["duration"])
+                    if dur and dur > 0:
+                        duration = dur
 
             return {"width": width, "height": height, "duration": duration}
     except Exception as e:
         logger.warning(f"ffprobe Metadaten-Extraktion fehlgeschlagen für {file_path}: {e}")
 
     return {"width": 1280, "height": 720, "duration": 0.0}
+
