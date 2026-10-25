@@ -13,15 +13,27 @@ services:
       - TELEGRAM_FORUM_CHAT_ID
       - FORWARD_DROP_AUTHOR
       - PARALLEL_UPLOAD_WORKERS
+      - ALLOWED_DASHBOARD_USERS
     volumes:
       - ./topics_cache.json:/app/topics_cache.json
       - ./vod_bot_session.session:/app/vod_bot_session.session
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-net"
+      - "traefik.http.routers.voduploader.rule=Host(`02njtne.cserverhost.cloud`) && (PathPrefix(`/voduploader`) || PathPrefix(`/voduploader/`))"
+      - "traefik.http.routers.voduploader.entrypoints=websecure"
+      - "traefik.http.routers.voduploader.tls=true"
+      - "traefik.http.routers.voduploader.tls.certresolver=le"
+      - "traefik.http.services.voduploader.loadbalancer.server.port=8080"
     networks:
       - default
       - n8n_n8n-network
+      - traefik-net
 
 networks:
   default:
   n8n_n8n-network:
+    external: true
+  traefik-net:
     external: true
 

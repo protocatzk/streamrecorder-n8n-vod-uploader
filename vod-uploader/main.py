@@ -6,13 +6,18 @@ import shutil
 import asyncio
 import logging
 import uuid
+import time
+import secrets
+import json
+import collections
 from datetime import datetime
 from aiohttp import web, ClientSession, ClientTimeout
-from telethon import TelegramClient
+from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
 from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_to_seconds
 from topic_manager import topic_manager
+from dashboard_templates import LOGIN_HTML, DASHBOARD_HTML
 
 # 1. Lade .env Datei falls vorhanden
 dotenv_file = find_dotenv(usecwd=True)
@@ -48,8 +53,9 @@ FORWARD_DROP_AUTHOR = os.getenv('FORWARD_DROP_AUTHOR', 'true').lower() in ('true
 SPLIT_THRESHOLD_BYTES = int(1.8 * 1024 * 1024 * 1024)   # 1.8 GB = 1.932.735.283 Bytes
 TARGET_PART_SIZE_BYTES = int(1.4 * 1024 * 1024 * 1024)  # 1.4 GB = 1.503.238.553 Bytes
 PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '6'))
+ALLOWED_DASHBOARD_USERS = os.getenv('ALLOWED_DASHBOARD_USERS', '@Ripperchieff,@x42067')
 
-logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS})")
+logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS})")
 
 PLATFORM_ICONS = {
     'tiktok': '📱 TikTok',
@@ -63,10 +69,38 @@ class BotState:
         self.upload_lock = asyncio.Lock()
         self.waiting_count = 0
         self.telegram_client: TelegramClient | None = None
+        self.bot_username: str = ""
+        self.active_job: dict | None = None
+        self.waiting_queue: list[dict] = []
+        self.history: collections.deque = collections.deque(maxlen=30)
+        self.log_buffer: collections.deque = collections.deque(maxlen=60)
+        self.pending_auth: dict = {}
+        self.active_sessions: dict = {}
+        self.sse_queues: set[asyncio.Queue] = set()
 
 state = BotState()
 
-async def download_file(url: str, output_path: str):
+class MemoryLogHandler(logging.Handler):
+    def __init__(self, buffer: collections.deque):
+        super().__init__()
+        self.buffer = buffer
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.buffer.append({
+                "time": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+                "level": record.levelname,
+                "message": msg
+            })
+        except Exception:
+            pass
+
+mem_handler = MemoryLogHandler(state.log_buffer)
+mem_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(mem_handler)
+
+async def download_file(url: str, output_path: str, progress_callback=None):
     logger.info(f"Starte Download von: {url[:80]}... nach {output_path}")
     timeout = ClientTimeout(total=None, sock_read=300, sock_connect=60)
     async with ClientSession(timeout=timeout) as session:
@@ -81,6 +115,8 @@ async def download_file(url: str, output_path: str):
                 async for chunk in response.content.iter_chunked(2 * 1024 * 1024):  # 2MB Chunks
                     f.write(chunk)
                     downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total_size)
                     mb = downloaded // (100 * 1024 * 1024)
                     if mb > last_logged_mb:
                         last_logged_mb = mb
@@ -287,6 +323,13 @@ async def handle_upload(request):
     streamer = data.get("streamer", "Unbekannt")
     title = data.get("title", "Livestream Recording")
 
+    job_info = {
+        "job_id": job_id,
+        "streamer": streamer,
+        "title": title,
+        "queued_at": datetime.now().strftime("%H:%M:%S")
+    }
+    state.waiting_queue.append(job_info)
     state.waiting_count += 1
     in_queue = True
     logger.info(f"[{job_id}] Request eingereiht ({streamer} - '{title}'). Wartende Jobs: {state.waiting_count}.")
@@ -300,6 +343,9 @@ async def handle_upload(request):
         async with state.upload_lock:
             in_queue = False
             state.waiting_count -= 1
+            if job_info in state.waiting_queue:
+                state.waiting_queue.remove(job_info)
+
             logger.info(f"[{job_id}] Bearbeitung gestartet! (Verbleibend in Queue: {state.waiting_count})")
 
             raw_chat_id = data.get("chat_id", DEFAULT_CHAT_ID)
@@ -327,6 +373,24 @@ async def handle_upload(request):
             recorded_at = data.get("recorded_at", "")
             formatted_date = format_recorded_at(recorded_at)
 
+            state.active_job = {
+                "job_id": job_id,
+                "streamer": streamer,
+                "title": title,
+                "platform": platform,
+                "stage": "downloading",
+                "stage_label": "Download von Streamrecorder",
+                "pct": 0,
+                "bytes_done": 0,
+                "bytes_total": 0,
+                "current_part": 0,
+                "total_parts": 0,
+                "part_name": "",
+                "speed_mbps": 0.0,
+                "eta_seconds": None,
+                "started_at": datetime.now().strftime("%H:%M:%S")
+            }
+
             # 1. Thumbnail vorab laden
             if thumbnail_url:
                 try:
@@ -337,7 +401,15 @@ async def handle_upload(request):
                     temp_thumb = None
 
             # 2. Video herunterladen
-            await download_file(download_url, temp_video)
+            def dl_progress(done, total):
+                if state.active_job:
+                    state.active_job['bytes_done'] = done
+                    state.active_job['bytes_total'] = total
+                    state.active_job['pct'] = int(done / total * 100) if total else 0
+                    state.active_job['stage'] = 'downloading'
+                    state.active_job['stage_label'] = 'Download von Streamrecorder'
+
+            await download_file(download_url, temp_video, progress_callback=dl_progress)
 
             actual_size = os.path.getsize(temp_video)
             actual_size_mb = round(actual_size / (1024 * 1024), 1)
@@ -414,16 +486,48 @@ async def handle_upload(request):
 
             # 4. Upload zu Telegram (Parallel Chunk-Upload mit Fallback)
             uploaded_message_ids = []
-            for file_to_upload, file_caption, display_filename in upload_files:
+            total_upload_files = len(upload_files)
+            for part_idx, (file_to_upload, file_caption, display_filename) in enumerate(upload_files, start=1):
                 file_mb = round(os.path.getsize(file_to_upload) / (1024 * 1024), 1)
                 logger.info(f"[{job_id}] Sende {display_filename} ({file_mb} MB) zu Chat {chat_id} (Parallele Worker: {PARALLEL_WORKERS})...")
 
+                if state.active_job:
+                    state.active_job['stage'] = 'uploading'
+                    state.active_job['stage_label'] = f"Upload Teil {part_idx}/{total_upload_files}"
+                    state.active_job['current_part'] = part_idx
+                    state.active_job['total_parts'] = total_upload_files
+                    state.active_job['part_name'] = display_filename
+                    state.active_job['pct'] = 0
+
                 last_reported_pct = -1
-                def make_progress_callback(f_name):
-                    nonlocal last_reported_pct
+                last_calc_time = time.time()
+                last_calc_bytes = 0
+
+                def make_progress_callback(f_name, p_idx, p_total):
+                    nonlocal last_reported_pct, last_calc_time, last_calc_bytes
                     def callback(current, total):
-                        nonlocal last_reported_pct
+                        nonlocal last_reported_pct, last_calc_time, last_calc_bytes
                         pct = int(current / total * 100) if total else 0
+                        now = time.time()
+                        time_diff = now - last_calc_time
+                        if time_diff >= 1.0:
+                            bytes_diff = current - last_calc_bytes
+                            speed_mbps = (bytes_diff / (1024 * 1024)) / time_diff if time_diff > 0 else 0.0
+                            eta_sec = (total - current) / (speed_mbps * 1024 * 1024) if speed_mbps > 0 and total > current else None
+                            last_calc_time = now
+                            last_calc_bytes = current
+
+                            if state.active_job:
+                                state.active_job['speed_mbps'] = speed_mbps
+                                state.active_job['eta_seconds'] = eta_sec
+
+                        if state.active_job:
+                            state.active_job['bytes_done'] = current
+                            state.active_job['bytes_total'] = total
+                            state.active_job['pct'] = pct
+                            state.active_job['stage'] = 'uploading'
+                            state.active_job['stage_label'] = f"Upload Teil {p_idx}/{p_total}"
+
                         if pct >= last_reported_pct + 25:
                             last_reported_pct = (pct // 25) * 25
                             logger.info(f"[{job_id}] Upload {f_name}: {last_reported_pct}% ({round(current/(1024*1024))} / {round(total/(1024*1024))} MB)")
@@ -447,7 +551,7 @@ async def handle_upload(request):
                         client=state.telegram_client,
                         file_path=file_to_upload,
                         max_workers=PARALLEL_WORKERS,
-                        progress_callback=make_progress_callback(display_filename)
+                        progress_callback=make_progress_callback(display_filename, part_idx, total_upload_files)
                     )
 
                     # Bereits hochgeladenen File-Handle mit Metadaten an den Chat senden
@@ -469,7 +573,7 @@ async def handle_upload(request):
                         thumb=temp_thumb if temp_thumb and os.path.exists(temp_thumb) else None,
                         parse_mode='html',
                         supports_streaming=True,
-                        progress_callback=make_progress_callback(display_filename)
+                        progress_callback=make_progress_callback(display_filename, part_idx, total_upload_files)
                     )
 
                 uploaded_message_ids.append(msg.id)
@@ -481,6 +585,10 @@ async def handle_upload(request):
             if forum_chat_id and uploaded_message_ids:
                 try:
                     topic_title = data.get("topic_name") or streamer or "Allgemein"
+                    if state.active_job:
+                        state.active_job['stage'] = 'forwarding'
+                        state.active_job['stage_label'] = f"Weiterleitung in Topic '{topic_title}'"
+
                     target_topic_id = await topic_manager.get_or_create_topic(
                         client=state.telegram_client,
                         forum_chat_id=forum_chat_id,
@@ -516,6 +624,21 @@ async def handle_upload(request):
                 except Exception as e:
                     logger.warning(f"[{job_id}] Konnte Streamrecorder nicht als downloaded markieren: {e}")
 
+            if state.active_job:
+                state.history.appendleft({
+                    "job_id": job_id,
+                    "streamer": streamer,
+                    "title": title,
+                    "platform": platform,
+                    "parts": len(uploaded_message_ids),
+                    "total_size_mb": actual_size_mb,
+                    "topic_id": target_topic_id,
+                    "topic_name": topic_title if 'topic_title' in locals() else streamer,
+                    "status": "success",
+                    "finished_at": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                })
+                state.active_job = None
+
             return web.json_response({
                 "status": "success",
                 "message_id": uploaded_message_ids[0],
@@ -529,11 +652,28 @@ async def handle_upload(request):
 
     except Exception as e:
         logger.error(f"[{job_id}] Fehler bei Verarbeitung: {e}", exc_info=True)
+        if state.active_job:
+            state.history.appendleft({
+                "job_id": job_id,
+                "streamer": streamer,
+                "title": title,
+                "platform": platform if 'platform' in locals() else "",
+                "parts": len(uploaded_message_ids) if 'uploaded_message_ids' in locals() else 0,
+                "total_size_mb": actual_size_mb if 'actual_size_mb' in locals() else 0,
+                "topic_id": None,
+                "topic_name": None,
+                "status": "failed",
+                "error": str(e),
+                "finished_at": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            })
+            state.active_job = None
         return web.json_response({"error": str(e)}, status=500)
 
     finally:
         if in_queue:
             state.waiting_count -= 1
+        if 'job_info' in locals() and job_info in state.waiting_queue:
+            state.waiting_queue.remove(job_info)
 
         # 6. Sauberes Aufräumen des gesamten Job-Verzeichnisses
         try:
@@ -559,10 +699,236 @@ async def handle_health(request):
         "forward_drop_author": FORWARD_DROP_AUTHOR
     })
 
+# --- Dashboard & Telegram Authentication Handlers ---
+
+async def handle_dashboard_page(request):
+    session_id = request.cookies.get("vod_session")
+    is_authed = False
+    if session_id and session_id in state.active_sessions:
+        if time.time() <= state.active_sessions[session_id].get("expires_at", 0):
+            is_authed = True
+        else:
+            del state.active_sessions[session_id]
+
+    if is_authed:
+        return web.Response(text=DASHBOARD_HTML, content_type='text/html')
+    else:
+        return web.Response(text=LOGIN_HTML, content_type='text/html')
+
+async def handle_auth_request(request):
+    token = secrets.token_hex(12)
+    state.pending_auth[token] = {
+        "status": "pending",
+        "created_at": time.time(),
+        "user": ""
+    }
+    # Aufräumen von Tokens älter als 10 Minuten
+    now = time.time()
+    for t in list(state.pending_auth.keys()):
+        if now - state.pending_auth[t].get("created_at", 0) > 600:
+            del state.pending_auth[t]
+
+    deep_link = f"https://t.me/{state.bot_username}?start=login_{token}" if state.bot_username else f"https://t.me/?start=login_{token}"
+    return web.json_response({
+        "token": token,
+        "bot_username": state.bot_username,
+        "deep_link": deep_link
+    })
+
+async def handle_auth_check(request):
+    token = request.query.get("token")
+    if not token or token not in state.pending_auth:
+        return web.json_response({"status": "expired"})
+
+    info = state.pending_auth[token]
+    status = info.get("status", "pending")
+    if status == "approved":
+        session_id = secrets.token_urlsafe(32)
+        user_name = info.get("user", "Admin")
+        state.active_sessions[session_id] = {
+            "user": user_name,
+            "expires_at": time.time() + (86400 * 30)  # 30 Tage gültig
+        }
+        del state.pending_auth[token]
+        resp = web.json_response({"status": "approved", "user": user_name})
+        resp.set_cookie("vod_session", session_id, max_age=86400 * 30, path="/", secure=True, httponly=True, samesite="Lax")
+        return resp
+
+    return web.json_response({"status": status})
+
+async def handle_logout(request):
+    session_id = request.cookies.get("vod_session")
+    if session_id and session_id in state.active_sessions:
+        del state.active_sessions[session_id]
+    resp = web.json_response({"status": "ok"})
+    resp.del_cookie("vod_session", path="/")
+    return resp
+
+async def handle_dashboard_status(request):
+    session_id = request.cookies.get("vod_session")
+    if not session_id or session_id not in state.active_sessions:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    session = state.active_sessions[session_id]
+    if time.time() > session.get("expires_at", 0):
+        del state.active_sessions[session_id]
+        return web.json_response({"error": "Session expired"}, status=401)
+
+    topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+    return web.json_response({
+        "user": session.get("user", "Admin"),
+        "queue_count": len(state.waiting_queue),
+        "topic_count": topic_count,
+        "active_job": state.active_job,
+        "queue": list(state.waiting_queue),
+        "history": list(state.history),
+        "logs": list(state.log_buffer)
+    })
+
+async def handle_dashboard_events(request):
+    session_id = request.cookies.get("vod_session")
+    if not session_id or session_id not in state.active_sessions:
+        return web.Response(status=401, text="Unauthorized")
+
+    session = state.active_sessions[session_id]
+    if time.time() > session.get("expires_at", 0):
+        del state.active_sessions[session_id]
+        return web.Response(status=401, text="Session expired")
+
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+    await response.prepare(request)
+
+    queue = asyncio.Queue()
+    state.sse_queues.add(queue)
+
+    try:
+        topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+        init_data = {
+            "user": session.get("user", "Admin"),
+            "queue_count": len(state.waiting_queue),
+            "topic_count": topic_count,
+            "active_job": state.active_job,
+            "queue": list(state.waiting_queue),
+            "history": list(state.history),
+            "logs": list(state.log_buffer)
+        }
+        await response.write(f"data: {json.dumps(init_data, ensure_ascii=False)}\n\n".encode('utf-8'))
+
+        while True:
+            await asyncio.sleep(1.5)
+            topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+            data = {
+                "user": session.get("user", "Admin"),
+                "queue_count": len(state.waiting_queue),
+                "topic_count": topic_count,
+                "active_job": state.active_job,
+                "queue": list(state.waiting_queue),
+                "history": list(state.history),
+                "logs": list(state.log_buffer)
+            }
+            await response.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
+    except (asyncio.CancelledError, ConnectionResetError):
+        pass
+    finally:
+        state.sse_queues.discard(queue)
+
+    return response
+
 async def on_startup(app):
     state.telegram_client = TelegramClient('vod_bot_session', API_ID, API_HASH)
     await state.telegram_client.start(bot_token=BOT_TOKEN)
-    logger.info("Telegram Bot Client und Queue-Lock erfolgreich gestartet!")
+    me = await state.telegram_client.get_me()
+    state.bot_username = getattr(me, 'username', '') or ''
+    logger.info(f"Telegram Bot @{state.bot_username} Client und Queue-Lock erfolgreich gestartet!")
+
+    # Registriere Telegram Bot Chat Event-Handler für Option B Dashboard Auth
+    @state.telegram_client.on(events.NewMessage(pattern=r'^/start(?:\s+login_([a-zA-Z0-9_-]+))?'))
+    async def handle_tg_start(event):
+        if not event.is_private:
+            return
+        token = event.pattern_match.group(1) if event.pattern_match else None
+        sender = await event.get_sender()
+        username = getattr(sender, 'username', None)
+        first_name = getattr(sender, 'first_name', '') or ''
+        user_handle = f"@{username}".lower() if username else ""
+        user_id_str = str(sender.id)
+
+        allowed_list = [u.strip().lower() for u in ALLOWED_DASHBOARD_USERS.split(',') if u.strip()]
+        is_allowed = any(
+            u == user_handle or u == (username or '').lower() or u == user_id_str
+            for u in allowed_list
+        )
+
+        if not is_allowed:
+            logger.warning(f"Unbefugter Dashboard Login-Versuch von @{username} (ID {sender.id})")
+            await event.respond("⛔ **Zugriff verweigert:** Dein Telegram-Account ist nicht für das VOD-Dashboard freigeschaltet.")
+            if token and token in state.pending_auth:
+                state.pending_auth[token]["status"] = "denied"
+            return
+
+        if not token or token not in state.pending_auth:
+            await event.respond(
+                f"👋 Hallo {first_name}!\n\n"
+                f"Ich bin dein VOD-Uploader Bot. Rufe `https://02njtne.cserverhost.cloud/voduploader` im Browser auf, um dich am Dashboard anzumelden."
+            )
+            return
+
+        state.pending_auth[token]["user"] = f"@{username}" if username else (first_name or user_id_str)
+        buttons = [
+            [
+                Button.inline("✅ Anmelden freigeben", data=f"auth_ok:{token}".encode('utf-8')),
+                Button.inline("❌ Ablehnen", data=f"auth_no:{token}".encode('utf-8'))
+            ]
+        ]
+        await event.respond(
+            f"🔐 **Login-Anfrage für VOD Dashboard**\n\n"
+            f"👤 Account: `@{username or sender.id}`\n"
+            f"🌐 URL: `https://02njtne.cserverhost.cloud/voduploader`\n"
+            f"⏱ Gültig für 5 Minuten.\n\n"
+            f"Möchtest du diese Anmeldung jetzt freigeben?",
+            buttons=buttons
+        )
+
+    @state.telegram_client.on(events.CallbackQuery(pattern=rb'^auth_(ok|no):(.+)'))
+    async def handle_tg_auth_callback(event):
+        action = event.pattern_match.group(1).decode('utf-8')
+        token = event.pattern_match.group(2).decode('utf-8')
+        sender = await event.get_sender()
+        username = getattr(sender, 'username', None)
+        user_handle = f"@{username}".lower() if username else ""
+        user_id_str = str(sender.id)
+
+        allowed_list = [u.strip().lower() for u in ALLOWED_DASHBOARD_USERS.split(',') if u.strip()]
+        is_allowed = any(
+            u == user_handle or u == (username or '').lower() or u == user_id_str
+            for u in allowed_list
+        )
+        if not is_allowed:
+            await event.answer("⛔ Zugriff verweigert!", alert=True)
+            return
+
+        if token not in state.pending_auth:
+            await event.edit("⚠️ Diese Login-Anfrage ist abgelaufen oder ungültig.")
+            await event.answer("Abgelaufen")
+            return
+
+        if action == "ok":
+            state.pending_auth[token]["status"] = "approved"
+            await event.edit("✅ **Anmeldung erfolgreich freigegeben!**\nDu bist jetzt im Dashboard angemeldet. Du kannst zum Browser zurückkehren.")
+            await event.answer("Erfolgreich freigegeben! 🎉")
+        else:
+            state.pending_auth[token]["status"] = "denied"
+            await event.edit("❌ **Anmeldung wurde abgelehnt.**")
+            await event.answer("Abgelehnt")
 
 async def on_cleanup(app):
     if state.telegram_client:
@@ -573,6 +939,16 @@ def create_app():
     app = web.Application()
     app.router.add_post('/upload', handle_upload)
     app.router.add_get('/health', handle_health)
+
+    # Dashboard & Auth Endpunkte
+    app.router.add_get('/voduploader', handle_dashboard_page)
+    app.router.add_get('/voduploader/', handle_dashboard_page)
+    app.router.add_post('/voduploader/api/auth/request', handle_auth_request)
+    app.router.add_get('/voduploader/api/auth/check', handle_auth_check)
+    app.router.add_post('/voduploader/api/logout', handle_logout)
+    app.router.add_get('/voduploader/api/status', handle_dashboard_status)
+    app.router.add_get('/voduploader/api/events', handle_dashboard_events)
+
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app

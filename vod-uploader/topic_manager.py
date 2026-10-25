@@ -46,7 +46,13 @@ class TopicManager:
             temp_file = f"{self.cache_file}.tmp"
             with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self.cache, f, indent=2, ensure_ascii=False)
-            os.replace(temp_file, self.cache_file)
+            try:
+                os.replace(temp_file, self.cache_file)
+            except OSError:
+                # Docker bind mount fallback: Inode cannot be replaced, copy in-place
+                shutil.copyfile(temp_file, self.cache_file)
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
         except Exception as e:
             logger.warning(f"Konnte Topic-Cache {self.cache_file} nicht schreiben: {e}")
 
