@@ -14,6 +14,13 @@ services:
       - FORWARD_DROP_AUTHOR
       - PARALLEL_UPLOAD_WORKERS
       - ALLOWED_DASHBOARD_USERS
+      - DOWNLOAD_INACTIVITY_TIMEOUT
+      - FFMPEG_THREADS
+    deploy:
+      resources:
+        limits:
+          cpus: '3.0'
+          memory: 4G
     volumes:
       - ./topics_cache.json:/app/topics_cache.json
       - ./vod_bot_session.session:/app/vod_bot_session.session

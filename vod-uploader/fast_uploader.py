@@ -126,7 +126,7 @@ class ParallelTransferrer:
 async def fast_upload_file(
     client: TelegramClient,
     file_path: str,
-    max_workers: int = 6,
+    max_workers: int = 3,
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> TypeInputFile:
     """
@@ -146,7 +146,7 @@ async def fast_upload_file(
 
         with open(file_path, "rb") as f:
             while True:
-                chunk = f.read(part_size)
+                chunk = await asyncio.to_thread(f.read, part_size)
                 if not chunk:
                     break
                 if hash_md5:
@@ -201,6 +201,7 @@ async def get_video_metadata(file_path: str) -> dict:
     """Extrahiert Breite, Höhe und Dauer des Videos via ffprobe für optimales Telegram-Streaming."""
     cmd = [
         "ffprobe",
+        "-threads", "2",
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=width,height,duration,r_frame_rate,avg_frame_rate,nb_frames:stream_tags=DURATION,DURATION-eng:format=duration",
