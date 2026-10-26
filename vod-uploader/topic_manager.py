@@ -1,6 +1,7 @@
 import re
 import os
 import json
+import shutil
 import logging
 from typing import Optional, Dict
 from telethon import TelegramClient, helpers
