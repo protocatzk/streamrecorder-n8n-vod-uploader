@@ -11,7 +11,8 @@ import secrets
 import json
 import collections
 from datetime import datetime
-from aiohttp import web, ClientSession, ClientTimeout
+import aiohttp
+from aiohttp import web, ClientSession, ClientTimeout, ClientError, ClientPayloadError
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
@@ -52,10 +53,12 @@ FORWARD_DROP_AUTHOR = os.getenv('FORWARD_DROP_AUTHOR', 'true').lower() in ('true
 # Maximale Dateigröße vor dem Aufteilen (1.8 GB) und Zielgröße pro Segment (1.4 GB für sicheren VBR-Puffer)
 SPLIT_THRESHOLD_BYTES = int(1.8 * 1024 * 1024 * 1024)   # 1.8 GB = 1.932.735.283 Bytes
 TARGET_PART_SIZE_BYTES = int(1.4 * 1024 * 1024 * 1024)  # 1.4 GB = 1.503.238.553 Bytes
-PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '6'))
+PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '3'))
+FFMPEG_THREADS = int(os.getenv('FFMPEG_THREADS', '2'))
 ALLOWED_DASHBOARD_USERS = os.getenv('ALLOWED_DASHBOARD_USERS', '@Ripperchieff,@x42067')
+DOWNLOAD_INACTIVITY_TIMEOUT = int(os.getenv('DOWNLOAD_INACTIVITY_TIMEOUT', '120'))
 
-logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS})")
+logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, FFmpeg-Threads: {FFMPEG_THREADS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS}, Inaktivitäts-Timeout: {DOWNLOAD_INACTIVITY_TIMEOUT}s)")
 
 PLATFORM_ICONS = {
     'tiktok': '📱 TikTok',
@@ -100,30 +103,56 @@ mem_handler = MemoryLogHandler(state.log_buffer)
 mem_handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(mem_handler)
 
-async def download_file(url: str, output_path: str, progress_callback=None):
-    logger.info(f"Starte Download von: {url[:80]}... nach {output_path}")
-    timeout = ClientTimeout(total=None, sock_read=300, sock_connect=60)
-    async with ClientSession(timeout=timeout) as session:
-        async with session.get(url) as response:
-            if response.status != 200:
-                raise Exception(f"Download fehlgeschlagen mit HTTP {response.status}")
-            
-            total_size = int(response.headers.get('Content-Length', 0))
-            downloaded = 0
-            last_logged_mb = 0
-            with open(output_path, 'wb') as f:
-                async for chunk in response.content.iter_chunked(2 * 1024 * 1024):  # 2MB Chunks
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if progress_callback:
-                        progress_callback(downloaded, total_size)
-                    mb = downloaded // (100 * 1024 * 1024)
-                    if mb > last_logged_mb:
-                        last_logged_mb = mb
-                        pct = f" ({round(downloaded / total_size * 100)}%)" if total_size else ""
-                        logger.info(f"Download Fortschritt: {round(downloaded / (1024*1024))} MB{pct}")
-                        
-            logger.info(f"Download fertig: {downloaded} Bytes heruntergeladen ({round(downloaded/1024/1024, 1)} MB).")
+async def download_file(url: str, output_path: str, progress_callback=None, inactivity_timeout: int = DOWNLOAD_INACTIVITY_TIMEOUT):
+    logger.info(f"Starte Download von: {url[:80]}... nach {output_path} (Inaktivitäts-Timeout: {inactivity_timeout}s)")
+    timeout = ClientTimeout(total=None, sock_read=inactivity_timeout, sock_connect=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Connection": "keep-alive"
+    }
+
+    try:
+        async with ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as response:
+                if response.status != 200:
+                    raise Exception(f"Download fehlgeschlagen mit HTTP {response.status}")
+
+                total_size = int(response.headers.get('Content-Length', 0))
+                downloaded = 0
+                last_logged_mb = 0
+                with open(output_path, 'wb') as f:
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(response.content.read(512 * 1024), timeout=float(inactivity_timeout))
+                        except (asyncio.TimeoutError, TimeoutError):
+                            raise asyncio.TimeoutError(f"Inaktivitäts-Timeout: Seit {inactivity_timeout} Sekunden wurden keine Daten empfangen.")
+
+                        if not chunk:
+                            break
+
+                        await asyncio.to_thread(f.write, chunk)
+                        downloaded += len(chunk)
+                        if progress_callback:
+                            progress_callback(downloaded, total_size)
+                        mb = downloaded // (100 * 1024 * 1024)
+                        if mb > last_logged_mb:
+                            last_logged_mb = mb
+                            pct = f" ({round(downloaded / total_size * 100)}%)" if total_size else ""
+                            logger.info(f"Download Fortschritt: {round(downloaded / (1024*1024))} MB{pct}")
+
+                if total_size and downloaded < total_size:
+                    raise ClientPayloadError(
+                        f"Unvollständige Übertragung: {downloaded} von {total_size} Bytes empfangen."
+                    )
+
+                logger.info(f"Download fertig: {downloaded} Bytes heruntergeladen ({round(downloaded/1024/1024, 1)} MB).")
+
+    except (ClientError, asyncio.TimeoutError, TimeoutError, OSError) as e:
+        logger.error(f"Download fehlgeschlagen ({type(e).__name__}: {e})")
+        raise
+
 
 def sanitize_cookie(raw_cookie: str | None) -> str | None:
     if not raw_cookie:
@@ -180,6 +209,7 @@ async def run_ffmpeg_segment(
 ) -> list[str]:
     cmd = [
         "ffmpeg",
+        "-threads", str(FFMPEG_THREADS),
         "-y",
         "-i", file_path,
         "-c", "copy",
@@ -394,14 +424,20 @@ async def handle_upload(request):
             # 1. Thumbnail vorab laden
             if thumbnail_url:
                 try:
-                    await download_file(thumbnail_url, temp_thumb)
+                    await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30)
                     logger.info(f"[{job_id}] Thumbnail erfolgreich geladen.")
                 except Exception as e:
                     logger.warning(f"[{job_id}] Thumbnail konnte nicht geladen werden, fahre ohne fort: {e}")
                     temp_thumb = None
 
             # 2. Video herunterladen
+            last_dl_report_time = 0.0
             def dl_progress(done, total):
+                nonlocal last_dl_report_time
+                now = time.time()
+                if now - last_dl_report_time < 0.5 and done < total:
+                    return
+                last_dl_report_time = now
                 if state.active_job:
                     state.active_job['bytes_done'] = done
                     state.active_job['bytes_total'] = total
@@ -409,7 +445,19 @@ async def handle_upload(request):
                     state.active_job['stage'] = 'downloading'
                     state.active_job['stage_label'] = 'Download von Streamrecorder'
 
-            await download_file(download_url, temp_video, progress_callback=dl_progress)
+            try:
+                await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
+            except Exception as dl_err:
+                logger.warning(f"[{job_id}] Download abgebrochen oder fehlgeschlagen ({dl_err}). Video wird übersprungen.")
+                if state.active_job and state.active_job.get("job_id") == job_id:
+                    state.active_job['stage'] = 'skipped'
+                    is_timeout = isinstance(dl_err, (asyncio.TimeoutError, TimeoutError)) or 'Inaktivitäts-Timeout' in str(dl_err)
+                    state.active_job['stage_label'] = f"Übersprungen ({DOWNLOAD_INACTIVITY_TIMEOUT}s Timeout)" if is_timeout else "Übersprungen (Download fehlgeschlagen)"
+                return web.json_response({
+                    "status": "skipped",
+                    "job_id": job_id,
+                    "message": f"Download fehlgeschlagen ({dl_err}), Video übersprungen."
+                }, status=200)
 
             actual_size = os.path.getsize(temp_video)
             actual_size_mb = round(actual_size / (1024 * 1024), 1)
@@ -502,11 +550,12 @@ async def handle_upload(request):
                 last_reported_pct = -1
                 last_calc_time = time.time()
                 last_calc_bytes = 0
+                last_ui_update_time = 0.0
 
                 def make_progress_callback(f_name, p_idx, p_total):
-                    nonlocal last_reported_pct, last_calc_time, last_calc_bytes
+                    nonlocal last_reported_pct, last_calc_time, last_calc_bytes, last_ui_update_time
                     def callback(current, total):
-                        nonlocal last_reported_pct, last_calc_time, last_calc_bytes
+                        nonlocal last_reported_pct, last_calc_time, last_calc_bytes, last_ui_update_time
                         pct = int(current / total * 100) if total else 0
                         now = time.time()
                         time_diff = now - last_calc_time
@@ -521,12 +570,14 @@ async def handle_upload(request):
                                 state.active_job['speed_mbps'] = speed_mbps
                                 state.active_job['eta_seconds'] = eta_sec
 
-                        if state.active_job:
-                            state.active_job['bytes_done'] = current
-                            state.active_job['bytes_total'] = total
-                            state.active_job['pct'] = pct
-                            state.active_job['stage'] = 'uploading'
-                            state.active_job['stage_label'] = f"Upload Teil {p_idx}/{p_total}"
+                        if now - last_ui_update_time >= 0.5 or current >= total:
+                            last_ui_update_time = now
+                            if state.active_job:
+                                state.active_job['bytes_done'] = current
+                                state.active_job['bytes_total'] = total
+                                state.active_job['pct'] = pct
+                                state.active_job['stage'] = 'uploading'
+                                state.active_job['stage_label'] = f"Upload Teil {p_idx}/{p_total}"
 
                         if pct >= last_reported_pct + 25:
                             last_reported_pct = (pct // 25) * 25
