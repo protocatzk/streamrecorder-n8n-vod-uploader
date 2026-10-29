@@ -3,6 +3,7 @@ services:
     build: .
     container_name: vod_uploader
     restart: unless-stopped
+    stop_grace_period: 30s
     env_file:
       - .env
     environment:
@@ -43,6 +44,9 @@ services:
       - N8N_WEBHOOKS
       - N8N_WEBHOOK_TIMEOUT
       - N8N_TRIGGER_COOLDOWN
+      - STATE_DIR
+      - JOB_DONE_TTL_DAYS
+      - JOB_STALE_DAYS
     deploy:
       resources:
         limits:
@@ -52,6 +56,7 @@ services:
       - ./topics_cache.json:/app/topics_cache.json
       - ./vod_bot_session.session:/app/vod_bot_session.session
       - ./rss_data:/app/rss_data
+      - ./state_data:/app/state
       # OPML-Datei wird nicht mehr benoetigt, da RSS_FEED_URLS genutzt wird.
       # Fuer den Rueckfall auf eine lokale OPML wieder einkommentieren:
       # - ../rss-app-opml.xml:/app/rss-app-opml.xml:ro

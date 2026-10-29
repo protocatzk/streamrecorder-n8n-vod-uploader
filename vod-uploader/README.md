@@ -211,6 +211,21 @@ N8N_TRIGGER_COOLDOWN=10
   eines laufenden 15-Minuten-Jobs kann Videos doppelt an den Uploader schicken,
   weil sie erst nach erfolgreichem Upload als `downloaded` markiert werden.
 
+## Persistenter Job-State
+
+Angenommene Jobs liegen inklusive Fortschritt unter `./state_data` (im Container
+`/app/state`) und ueberleben Neustarts und Deploys:
+
+- `jobs.json`: offene Jobs mit Stage (`queued`, `downloading`, `uploading`, ...).
+- `done.json`: abgeschlossene Jobs fuer die Duplikat-Erkennung (`JOB_DONE_TTL_DAYS`, Standard 14).
+- `jobs/<key>/`: Download-Datei und fertige Split-Teile.
+
+Beim Start werden offene Jobs automatisch fortgesetzt. Bereits gesendete
+Telegram-Teile werden anhand ihrer Message-ID uebersprungen; ein Neustart kostet
+hoechstens den gerade laufenden Teil. Doppelte `/upload`-Requests (z. B. ein
+n8n-Retry nach einem Neustart) liefern `202 duplicate` statt eines zweiten
+Uploads. Verwaiste Job-Verzeichnisse werden nach `JOB_STALE_DAYS` entfernt.
+
 ## Fehlersuche
 
 - `Keine RSS-Feeds konfiguriert`: Weder `RSS_FEED_URLS` noch eine OPML ist

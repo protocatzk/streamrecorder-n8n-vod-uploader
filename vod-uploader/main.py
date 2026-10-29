@@ -21,6 +21,7 @@ from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_t
 from topic_manager import topic_manager
 from rss_archiver import RssArchiver, RssItem, LiveStream, is_live_error
 from dashboard_templates import LOGIN_HTML, DASHBOARD_HTML, TOPICS_HTML
+from job_store import JobStore
 
 # 1. Lade .env Datei falls vorhanden
 dotenv_file = find_dotenv(usecwd=True)
@@ -104,6 +105,14 @@ N8N_WEBHOOKS = parse_n8n_webhooks(os.getenv('N8N_WEBHOOKS', ''))
 N8N_WEBHOOK_TIMEOUT = max(1, int(os.getenv('N8N_WEBHOOK_TIMEOUT', '10')))
 N8N_TRIGGER_COOLDOWN = max(0, int(os.getenv('N8N_TRIGGER_COOLDOWN', '10')))
 
+# --- Persistenter Job-State ---
+STATE_DIR = os.getenv('STATE_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'state')
+JOB_STORE = JobStore(
+    STATE_DIR,
+    done_ttl_days=int(os.getenv('JOB_DONE_TTL_DAYS', '14')),
+    stale_days=int(os.getenv('JOB_STALE_DAYS', '3')),
+)
+
 logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, FFmpeg-Threads: {FFMPEG_THREADS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS}, Inaktivitäts-Timeout: {DOWNLOAD_INACTIVITY_TIMEOUT}s)")
 
 PLATFORM_ICONS = {
@@ -156,6 +165,9 @@ class BotState:
         self.active_sessions: dict = {}
         self.sse_queues: set[asyncio.Queue] = set()
         self.n8n_last_trigger: dict[str, float] = {}
+        self.job_running: set[str] = set()
+        self.job_events: dict[str, asyncio.Event] = {}
+        self.shutting_down: bool = False
 
 state = BotState()
 
@@ -424,18 +436,39 @@ async def split_video_to_parts(
 
     return verified_parts
 
-async def process_job(data: dict) -> tuple[dict, int]:
+async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int]:
     """Verarbeitet einen Download-/Upload-Job.
 
     Wird sowohl von ``/upload`` (n8n) als auch vom RSS-Archiv aufgerufen und
-    serialisiert alle Uploads über ``state.upload_lock``.
+    serialisiert alle Uploads über ``state.upload_lock``. Der Fortschritt wird
+    in ``JOB_STORE`` festgehalten, damit ein Neustart den Job fortsetzen kann.
     """
     download_url = data.get("download_url")
     if not download_url:
         return {"error": "Missing download_url"}, 400
 
+    key = job_key or JOB_STORE.key_for(data)
+    if key in state.job_running:
+        return {"status": "duplicate", "key": key, "message": "Job laeuft bereits."}, 202
+
     recording_id = str(data.get("recording_id", ""))
     job_id = recording_id or str(uuid.uuid4())[:8]
+
+    record = JOB_STORE.get(key)
+    if record is None:
+        record = JOB_STORE.create(key, data, job_id)
+    else:
+        job_id = record.get("job_id") or job_id
+        data = {**record.get("payload", {}), **data}
+        logger.info(
+            f"[{job_id}] Setze gespeicherten Job fort "
+            f"(Status: {record.get('status')}, Stage: {record.get('stage')}, "
+            f"Versuche: {record.get('attempts')})."
+        )
+
+    state.job_running.add(key)
+    state.job_events.setdefault(key, asyncio.Event())
+
     streamer = data.get("streamer", "Unbekannt")
     title = data.get("title", "Livestream Recording")
     source = str(data.get("source") or "streamrecorder")
@@ -454,13 +487,14 @@ async def process_job(data: dict) -> tuple[dict, int]:
     in_queue = True
     logger.info(f"[{job_id}] Request eingereiht ({streamer} - '{title}', Quelle: {source}). Wartende Jobs: {state.waiting_count}.")
 
-    job_dir = f"/tmp/job_{job_id}"
+    job_dir = record.get("job_dir") or JOB_STORE.job_dir_for(key)
     os.makedirs(job_dir, exist_ok=True)
-    temp_video = os.path.join(job_dir, f"stream_{job_id}.mp4")
+    temp_video = record.get("video_path") or os.path.join(job_dir, f"stream_{job_id}.mp4")
     temp_thumb = os.path.join(job_dir, f"thumb_{job_id}.jpg") if data.get("thumbnail_url") else None
     platform = str(data.get("platform") or "").lower()
     actual_size_mb = 0
-    uploaded_message_ids = []
+    uploaded_message_ids = list(record.get("uploaded_message_ids") or [])
+    keep_files = False
 
     try:
         async with state.upload_lock:
@@ -470,6 +504,17 @@ async def process_job(data: dict) -> tuple[dict, int]:
                 state.waiting_queue.remove(job_info)
 
             logger.info(f"[{job_id}] Bearbeitung gestartet! (Verbleibend in Queue: {state.waiting_count})")
+
+            record = JOB_STORE.mark_running(key)
+            saved_parts = record.get("parts") or []
+            need_download = not (
+                record.get("downloaded")
+                and os.path.exists(temp_video)
+                and os.path.getsize(temp_video) == int(record.get("downloaded_size") or 0)
+            )
+            if not need_download:
+                logger.info(f"[{job_id}] Download-Datei bereits vorhanden, ueberspringe Download.")
+                JOB_STORE.update(key, stage="splitting")
 
             raw_chat_id = data.get("chat_id", DEFAULT_CHAT_ID)
             try:
@@ -515,8 +560,8 @@ async def process_job(data: dict) -> tuple[dict, int]:
                 "started_at": datetime.now().strftime("%H:%M:%S")
             }
 
-            # 1. Thumbnail vorab laden
-            if thumbnail_url:
+            # 1. Thumbnail vorab laden (falls nicht bereits vorhanden)
+            if thumbnail_url and not (temp_thumb and os.path.exists(temp_thumb)):
                 try:
                     await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30)
                     logger.info(f"[{job_id}] Thumbnail erfolgreich geladen.")
@@ -524,71 +569,87 @@ async def process_job(data: dict) -> tuple[dict, int]:
                     logger.warning(f"[{job_id}] Thumbnail konnte nicht geladen werden, fahre ohne fort: {e}")
                     temp_thumb = None
 
-            # 2. Video herunterladen
-            last_dl_report_time = 0.0
-            def dl_progress(done, total):
-                nonlocal last_dl_report_time
-                now = time.time()
-                if now - last_dl_report_time < 0.5 and done < total:
-                    return
-                last_dl_report_time = now
-                if state.active_job:
-                    state.active_job['bytes_done'] = done
-                    state.active_job['bytes_total'] = total
-                    state.active_job['pct'] = int(done / total * 100) if total else 0
-                    state.active_job['stage'] = 'downloading'
-                    state.active_job['stage_label'] = download_label
-
-            try:
-                if use_ytdlp:
+            # 2. Video herunterladen oder gespeicherte Datei wiederverwenden
+            if need_download:
+                last_dl_report_time = 0.0
+                def dl_progress(done, total):
+                    nonlocal last_dl_report_time
+                    now = time.time()
+                    if now - last_dl_report_time < 0.5 and done < total:
+                        return
+                    last_dl_report_time = now
                     if state.active_job:
-                        state.active_job['stage_label'] = "Video-Analyse (yt-dlp)"
-                    temp_video = await rss_archiver.download_video(
-                        download_url,
-                        os.path.join(job_dir, f"stream_{job_id}"),
-                        progress_callback=dl_progress
-                    )
-                    logger.info(f"[{job_id}] yt-dlp-Download abgeschlossen: {os.path.basename(temp_video)}")
-                else:
-                    await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
-            except LiveStream as live_err:
-                logger.info(f"[{job_id}] {live_err}. Item bleibt für einen späteren Versuch vorgemerkt.")
-                if state.active_job and state.active_job.get("job_id") == job_id:
-                    state.active_job['stage'] = 'waiting'
-                    state.active_job['stage_label'] = str(live_err)
-                return {
-                    "status": "live",
-                    "job_id": job_id,
-                    "message": str(live_err)
-                }, 200
-            except Exception as dl_err:
-                if use_ytdlp and is_live_error(dl_err):
-                    logger.info(f"[{job_id}] Live/Premiere erkannt ({dl_err}). Item bleibt für einen späteren Versuch vorgemerkt.")
+                        state.active_job['bytes_done'] = done
+                        state.active_job['bytes_total'] = total
+                        state.active_job['pct'] = int(done / total * 100) if total else 0
+                        state.active_job['stage'] = 'downloading'
+                        state.active_job['stage_label'] = download_label
+
+                try:
+                    if use_ytdlp:
+                        if state.active_job:
+                            state.active_job['stage_label'] = "Video-Analyse (yt-dlp)"
+                        temp_video = await rss_archiver.download_video(
+                            download_url,
+                            os.path.join(job_dir, f"stream_{job_id}"),
+                            progress_callback=dl_progress
+                        )
+                        logger.info(f"[{job_id}] yt-dlp-Download abgeschlossen: {os.path.basename(temp_video)}")
+                    else:
+                        await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
+                except LiveStream as live_err:
+                    logger.info(f"[{job_id}] {live_err}. Item bleibt für einen späteren Versuch vorgemerkt.")
                     if state.active_job and state.active_job.get("job_id") == job_id:
                         state.active_job['stage'] = 'waiting'
-                        state.active_job['stage_label'] = "Wartet auf Stream-Ende"
+                        state.active_job['stage_label'] = str(live_err)
+                    JOB_STORE.complete(key, status="live", remember=False)
                     return {
                         "status": "live",
                         "job_id": job_id,
-                        "message": str(dl_err)
+                        "message": str(live_err)
                     }, 200
-                logger.warning(f"[{job_id}] Download abgebrochen oder fehlgeschlagen ({dl_err}). Video wird übersprungen.")
-                if state.active_job and state.active_job.get("job_id") == job_id:
-                    state.active_job['stage'] = 'skipped'
-                    is_timeout = isinstance(dl_err, (asyncio.TimeoutError, TimeoutError)) or 'Inaktivitäts-Timeout' in str(dl_err)
-                    state.active_job['stage_label'] = f"Übersprungen ({DOWNLOAD_INACTIVITY_TIMEOUT}s Timeout)" if is_timeout else "Übersprungen (Download fehlgeschlagen)"
-                return {
-                    "status": "skipped",
-                    "job_id": job_id,
-                    "message": f"Download fehlgeschlagen ({dl_err}), Video übersprungen."
-                }, 200
+                except Exception as dl_err:
+                    if use_ytdlp and is_live_error(dl_err):
+                        logger.info(f"[{job_id}] Live/Premiere erkannt ({dl_err}). Item bleibt für einen späteren Versuch vorgemerkt.")
+                        if state.active_job and state.active_job.get("job_id") == job_id:
+                            state.active_job['stage'] = 'waiting'
+                            state.active_job['stage_label'] = "Wartet auf Stream-Ende"
+                        JOB_STORE.complete(key, status="live", remember=False)
+                        return {
+                            "status": "live",
+                            "job_id": job_id,
+                            "message": str(dl_err)
+                        }, 200
+                    logger.warning(f"[{job_id}] Download abgebrochen oder fehlgeschlagen ({dl_err}). Video wird übersprungen.")
+                    if state.active_job and state.active_job.get("job_id") == job_id:
+                        state.active_job['stage'] = 'skipped'
+                        is_timeout = isinstance(dl_err, (asyncio.TimeoutError, TimeoutError)) or 'Inaktivitäts-Timeout' in str(dl_err)
+                        state.active_job['stage_label'] = f"Übersprungen ({DOWNLOAD_INACTIVITY_TIMEOUT}s Timeout)" if is_timeout else "Übersprungen (Download fehlgeschlagen)"
+                    JOB_STORE.complete(key, status="skipped", remember=False)
+                    return {
+                        "status": "skipped",
+                        "job_id": job_id,
+                        "message": f"Download fehlgeschlagen ({dl_err}), Video übersprungen."
+                    }, 200
 
-            if not os.path.exists(temp_video):
-                return {"status": "skipped", "job_id": job_id, "message": "Download-Datei fehlt."}, 200
+                if not os.path.exists(temp_video):
+                    JOB_STORE.complete(key, status="skipped", remember=False)
+                    return {"status": "skipped", "job_id": job_id, "message": "Download-Datei fehlt."}, 200
 
-            actual_size = os.path.getsize(temp_video)
+                actual_size = os.path.getsize(temp_video)
+                JOB_STORE.update(
+                    key,
+                    downloaded=True,
+                    downloaded_size=actual_size,
+                    video_path=temp_video,
+                    stage="splitting",
+                )
+                logger.info(f"[{job_id}] Download abgeschlossen. Tatsächliche Größe: {round(actual_size / (1024 * 1024), 1)} MB")
+            else:
+                actual_size = int(record.get("downloaded_size") or os.path.getsize(temp_video))
+                logger.info(f"[{job_id}] Verwende vorhandene Download-Datei ({round(actual_size / (1024 * 1024), 1)} MB).")
+
             actual_size_mb = round(actual_size / (1024 * 1024), 1)
-            logger.info(f"[{job_id}] Download abgeschlossen. Tatsächliche Größe: {actual_size_mb} MB")
 
             platform_label = PLATFORM_ICONS.get(platform, f"🌐 {platform.capitalize() if platform else 'Stream'}")
             clean_streamer = "".join(c for c in streamer if c.isalnum() or c in ('_', '-')).strip() or "stream"
@@ -598,10 +659,16 @@ async def process_job(data: dict) -> tuple[dict, int]:
             if source_url:
                 safe_source = html.escape(str(source_url), quote=True)
                 source_line = f'🔗 <b>Quelle:</b> <a href="{safe_source}">Original</a>'
-            upload_files: list[tuple[str, str, str]] = []  # (file_path, caption, display_filename)
+            upload_files: list[dict] = list(saved_parts)
 
-            # 3. Prüfen ob Aufteilung nötig (> 1.8 GB)
-            if actual_size > SPLIT_THRESHOLD_BYTES:
+            # 3. Aufteilung nur berechnen, wenn noch keine Teile gespeichert sind
+            if upload_files and not all(os.path.exists(part.get("path", "")) for part in upload_files):
+                logger.warning(f"[{job_id}] Gespeicherte Videoteile fehlen, Aufteilung wird neu erstellt.")
+                upload_files = []
+
+            if not upload_files and actual_size > SPLIT_THRESHOLD_BYTES:
+                for stale_step in glob.glob(os.path.join(job_dir, "split_step_*")):
+                    shutil.rmtree(stale_step, ignore_errors=True)
                 duration_sec = await get_video_duration(temp_video)
                 if not duration_sec:
                     duration_sec = parse_duration_to_seconds(duration)
@@ -631,7 +698,7 @@ async def process_job(data: dict) -> tuple[dict, int]:
                     caption_lines.append(source_line)
                 main_caption = "\n".join(caption_lines)
                 display_filename_1 = f"{clean_streamer}_{job_id}_part01.mp4"
-                upload_files.append((split_parts[0], main_caption, display_filename_1))
+                upload_files.append({"path": split_parts[0], "caption": main_caption, "filename": display_filename_1})
 
                 # Teil 2..N nummeriert
                 for idx, part_path in enumerate(split_parts[1:], start=2):
@@ -647,8 +714,8 @@ async def process_job(data: dict) -> tuple[dict, int]:
                         sub_caption_lines.append(source_line)
                     sub_caption = "\n".join(sub_caption_lines)
                     display_filename_n = f"{clean_streamer}_{job_id}_part{idx:02d}.mp4"
-                    upload_files.append((part_path, sub_caption, display_filename_n))
-            else:
+                    upload_files.append({"path": part_path, "caption": sub_caption, "filename": display_filename_n})
+            elif not upload_files:
                 caption_lines = [
                     f"🎥 <b>{heading}</b>\n",
                     f"👤 <b>{person_label}:</b> {escape_html(streamer)}",
@@ -669,12 +736,27 @@ async def process_job(data: dict) -> tuple[dict, int]:
                     caption_lines.append(source_line)
                 caption = "\n".join(caption_lines)
                 display_filename_single = f"{clean_streamer}_{job_id}.mp4"
-                upload_files.append((temp_video, caption, display_filename_single))
+                upload_files.append({"path": temp_video, "caption": caption, "filename": display_filename_single})
+
+            JOB_STORE.update(key, parts=upload_files, stage="uploading")
+            if saved_parts:
+                logger.info(f"[{job_id}] Setze Upload mit {len(upload_files)} gespeicherten Teil(en) fort.")
 
             # 4. Upload zu Telegram (Parallel Chunk-Upload mit Fallback)
             uploaded_message_ids = []
             total_upload_files = len(upload_files)
-            for part_idx, (file_to_upload, file_caption, display_filename) in enumerate(upload_files, start=1):
+            for part_idx, part in enumerate(upload_files, start=1):
+                if part.get("message_id"):
+                    uploaded_message_ids.append(part["message_id"])
+                    logger.info(
+                        f"[{job_id}] Teil {part_idx}/{total_upload_files} wurde bereits hochgeladen "
+                        f"(Message ID: {part['message_id']}), ueberspringe."
+                    )
+                    continue
+
+                file_to_upload = part["path"]
+                file_caption = part["caption"]
+                display_filename = part["filename"]
                 file_mb = round(os.path.getsize(file_to_upload) / (1024 * 1024), 1)
                 logger.info(f"[{job_id}] Sende {display_filename} ({file_mb} MB) zu Chat {chat_id} (Parallele Worker: {PARALLEL_WORKERS})...")
 
@@ -767,12 +849,14 @@ async def process_job(data: dict) -> tuple[dict, int]:
                     )
 
                 uploaded_message_ids.append(msg.id)
+                part["message_id"] = msg.id
+                JOB_STORE.update(key, parts=upload_files, uploaded_message_ids=uploaded_message_ids)
                 logger.info(f"[{job_id}] Upload erfolgreich! Message ID: {msg.id}")
 
             # 4b. Weiterleiten in Forum-Supergruppe und Topic-Sortierung (falls konfiguriert)
-            forum_message_ids = []
-            target_topic_id = None
-            if forum_chat_id and uploaded_message_ids:
+            forum_message_ids = list(record.get("forum_message_ids") or [])
+            target_topic_id = record.get("topic_id")
+            if forum_chat_id and uploaded_message_ids and not forum_message_ids:
                 try:
                     topic_title = data.get("topic_name") or streamer or "Allgemein"
                     if state.active_job:
@@ -792,9 +876,14 @@ async def process_job(data: dict) -> tuple[dict, int]:
                         topic_id=target_topic_id,
                         drop_author=FORWARD_DROP_AUTHOR
                     )
+                    JOB_STORE.update(key, forum_message_ids=forum_message_ids, topic_id=target_topic_id)
                     logger.info(f"[{job_id}] Video-Nachricht(en) erfolgreich in Forum {forum_chat_id} (Topic '{topic_title}' [ID {target_topic_id}]) weitergeleitet.")
                 except Exception as fwd_err:
                     logger.error(f"[{job_id}] Fehler beim Weiterleiten in Forum-Topic: {fwd_err}", exc_info=True)
+            elif forum_message_ids:
+                logger.info(f"[{job_id}] Weiterleitung wurde bereits erledigt, ueberspringe.")
+                if 'topic_title' not in locals():
+                    topic_title = data.get("topic_name") or streamer or "Allgemein"
 
             # 5. Direkt auf Streamrecorder als 'downloaded' markieren (falls Cookie vorhanden)
             raw_cookie = data.get("cookie") or os.getenv("STREAMRECORDER_COOKIE")
@@ -830,6 +919,7 @@ async def process_job(data: dict) -> tuple[dict, int]:
                 })
                 state.active_job = None
 
+            JOB_STORE.complete(key)
             return {
                 "status": "success",
                 "message_id": uploaded_message_ids[0],
@@ -842,6 +932,11 @@ async def process_job(data: dict) -> tuple[dict, int]:
             }, 200
 
     except Exception as e:
+        keep_files = True
+        try:
+            JOB_STORE.fail(key, str(e))
+        except Exception as store_err:
+            logger.warning(f"[{job_id}] Konnte Job-State nicht speichern: {store_err}")
         logger.error(f"[{job_id}] Fehler bei Verarbeitung: {e}", exc_info=True)
         if state.active_job:
             state.history.appendleft({
@@ -867,9 +962,16 @@ async def process_job(data: dict) -> tuple[dict, int]:
         if 'job_info' in locals() and job_info in state.waiting_queue:
             state.waiting_queue.remove(job_info)
 
-        # 6. Sauberes Aufräumen des gesamten Job-Verzeichnisses
+        state.job_running.discard(key)
+        pending_event = state.job_events.pop(key, None)
+        if pending_event is not None:
+            pending_event.set()
+
+        # 6. Aufräumen: nur wenn der Job abgeschlossen ist, nicht bei Fehlern/Shutdown
         try:
-            if os.path.exists(job_dir):
+            if keep_files:
+                logger.info(f"[{job_id}] Job-Verzeichnis bleibt fuer Wiederaufnahme erhalten: {job_dir}")
+            elif os.path.exists(job_dir):
                 shutil.rmtree(job_dir, ignore_errors=True)
                 logger.info(f"[{job_id}] Temporäres Job-Verzeichnis gelöscht: {job_dir}")
         except Exception as e:
@@ -881,6 +983,11 @@ async def handle_upload(request):
         data = await request.json()
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    key = JOB_STORE.key_for(data)
+    if JOB_STORE.is_done(key) or key in state.job_running:
+        logger.info(f"[{key}] Doppelter Upload-Request ignoriert (Job laeuft bereits oder ist abgeschlossen).")
+        return web.json_response({"status": "duplicate", "key": key}, status=202)
 
     payload, status = await process_job(data)
     return web.json_response(payload, status=status)
@@ -906,6 +1013,18 @@ async def archive_rss_item(item: RssItem) -> dict:
         "topic_name": item.channel if RSS_TOPIC_PER_FEED else None,
     }
     payload, status = await process_job(job_data)
+
+    if status == 202 and payload.get("status") == "duplicate":
+        key = payload.get("key") or JOB_STORE.key_for(job_data)
+        event = state.job_events.get(key)
+        if event is not None:
+            logger.info(f"[{key}] Job laeuft bereits, warte auf Abschluss (Wiederaufnahme).")
+            await event.wait()
+        record = JOB_STORE.get(key)
+        if record is not None and record.get("status") == "failed":
+            raise RuntimeError(record.get("error") or "Job fehlgeschlagen")
+        return {"status": "duplicate", "key": key}
+
     if status >= 400:
         raise RuntimeError(payload.get("error") or f"HTTP {status}")
     return payload
@@ -1472,6 +1591,24 @@ async def handle_dashboard_events(request):
 
     return response
 
+async def resume_pending_jobs():
+    """Setzt nach einem Neustart angenommene, aber nicht abgeschlossene Jobs fort."""
+    await asyncio.sleep(3)
+    records = JOB_STORE.pending()
+    if not records:
+        return
+    logger.info(f"Setze {len(records)} gespeicherte(n) Job(s) nach Neustart fort.")
+    for record in records:
+        if state.shutting_down:
+            break
+        payload = record.get("payload") or {}
+        key = record.get("key")
+        try:
+            await process_job(payload, job_key=key)
+        except Exception as exc:
+            logger.error(f"[{key}] Wiederaufnahme fehlgeschlagen: {exc}", exc_info=True)
+
+
 async def on_startup(app):
     state.telegram_client = TelegramClient('vod_bot_session', API_ID, API_HASH)
     await state.telegram_client.start(bot_token=BOT_TOKEN)
@@ -1496,6 +1633,9 @@ async def on_startup(app):
         )
     else:
         logger.info("RSS-Archiv ist deaktiviert (RSS_ENABLED=false).")
+
+    # Gespeicherte Jobs aus einem vorherigen Lauf wieder aufnehmen
+    asyncio.create_task(resume_pending_jobs())
 
     # Registriere Telegram Bot Chat Event-Handler für Option B Dashboard Auth
     @state.telegram_client.on(events.NewMessage(pattern=r'^/start(?:\s+login_([a-zA-Z0-9_-]+))?'))
@@ -1578,6 +1718,7 @@ async def on_startup(app):
             await event.answer("Abgelehnt")
 
 async def on_cleanup(app):
+    state.shutting_down = True
     rss_archiver.stop()
     if state.telegram_client:
         await state.telegram_client.disconnect()

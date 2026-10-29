@@ -12,5 +12,6 @@ streamrecorder-karbfenchieff.io.har
 rss-app-opml.xml
 vod-uploader/rss_state.json
 vod-uploader/rss_data/
+vod-uploader/state_data/
 vod-uploader/ytdlp/
 vod-uploader/cookies.txt
