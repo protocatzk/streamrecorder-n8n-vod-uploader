@@ -2,6 +2,10 @@
 
 Telegram-Archiv fuer Streamrecorder-VODs (per n8n) und fuer rss.app-Feeds.
 
+> Projektuebersicht, Architektur, Betrieb und Lizenzhinweise stehen im
+> [Root-README](../README.md); Lizenzen Dritter in
+> [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
 ## Endpunkte
 
 | Methode | Pfad | Zweck |
