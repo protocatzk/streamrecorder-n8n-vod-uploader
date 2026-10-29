@@ -16,6 +16,33 @@ services:
       - ALLOWED_DASHBOARD_USERS
       - DOWNLOAD_INACTIVITY_TIMEOUT
       - FFMPEG_THREADS
+      - RSS_ENABLED
+      - RSS_OPML_FILE
+      - RSS_FEED_TITLES
+      - RSS_FEED_URLS
+      - RSS_STATE_FILE
+      - RSS_POLL_INTERVAL_SECONDS
+      - RSS_INITIAL_BACKFILL
+      - RSS_MAX_ITEM_AGE_HOURS
+      - RSS_MAX_ITEMS_PER_POLL
+      - RSS_MAX_RETRIES
+      - RSS_RETRY_BASE_SECONDS
+      - RSS_RETRY_MAX_DELAY_SECONDS
+      - RSS_LIVE_RECHECK_SECONDS
+      - RSS_ALLOW_LIVE
+      - RSS_STATE_RETENTION_DAYS
+      - RSS_TOPIC_PER_FEED
+      - RSS_ARCHIVE_CHAT_ID
+      - RSS_ARCHIVE_FORUM_CHAT_ID
+      - YTDLP_COOKIES_FILE
+      - YTDLP_CONCURRENT_FRAGMENTS
+      - YTDLP_RETRIES
+      - YTDLP_HTTP_CHUNK_SIZE
+      - YTDLP_FORMAT
+      - DOWNLOAD_CHUNK_SIZE
+      - N8N_WEBHOOKS
+      - N8N_WEBHOOK_TIMEOUT
+      - N8N_TRIGGER_COOLDOWN
     deploy:
       resources:
         limits:
@@ -24,6 +51,12 @@ services:
     volumes:
       - ./topics_cache.json:/app/topics_cache.json
       - ./vod_bot_session.session:/app/vod_bot_session.session
+      - ./rss_data:/app/rss_data
+      # OPML-Datei wird nicht mehr benoetigt, da RSS_FEED_URLS genutzt wird.
+      # Fuer den Rueckfall auf eine lokale OPML wieder einkommentieren:
+      # - ../rss-app-opml.xml:/app/rss-app-opml.xml:ro
+      # Optional: Netscape-Cookies fuer yt-dlp (X/Twitter/YouTube-Login)
+      # - ./ytdlp:/app/ytdlp:ro
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik-net"

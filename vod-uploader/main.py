@@ -9,6 +9,7 @@ import uuid
 import time
 import secrets
 import json
+import html
 import collections
 from datetime import datetime
 import aiohttp
@@ -18,7 +19,8 @@ from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
 from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_to_seconds
 from topic_manager import topic_manager
-from dashboard_templates import LOGIN_HTML, DASHBOARD_HTML
+from rss_archiver import RssArchiver, RssItem, LiveStream, is_live_error
+from dashboard_templates import LOGIN_HTML, DASHBOARD_HTML, TOPICS_HTML
 
 # 1. Lade .env Datei falls vorhanden
 dotenv_file = find_dotenv(usecwd=True)
@@ -57,6 +59,50 @@ PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '3'))
 FFMPEG_THREADS = int(os.getenv('FFMPEG_THREADS', '2'))
 ALLOWED_DASHBOARD_USERS = os.getenv('ALLOWED_DASHBOARD_USERS', '@Ripperchieff,@x42067')
 DOWNLOAD_INACTIVITY_TIMEOUT = int(os.getenv('DOWNLOAD_INACTIVITY_TIMEOUT', '120'))
+DOWNLOAD_CHUNK_SIZE = max(64 * 1024, int(os.getenv('DOWNLOAD_CHUNK_SIZE', str(1024 * 1024))))
+
+# --- rss.app Archiv ---
+RSS_ENABLED = os.getenv('RSS_ENABLED', 'true').lower() in ('true', '1', 'yes')
+RSS_OPML_FILE = os.getenv('RSS_OPML_FILE', 'rss-app-opml.xml')
+RSS_FEED_URLS = [u.strip() for u in os.getenv('RSS_FEED_URLS', '').replace('\n', ',').split(',') if u.strip()]
+RSS_FEED_TITLES = [t.strip() for t in os.getenv('RSS_FEED_TITLES', '').split(',') if t.strip()]
+RSS_STATE_FILE = os.getenv('RSS_STATE_FILE', 'rss_data/rss_state.json')
+RSS_POLL_INTERVAL = int(os.getenv('RSS_POLL_INTERVAL_SECONDS', '900'))
+RSS_INITIAL_BACKFILL = os.getenv('RSS_INITIAL_BACKFILL', 'false').lower() in ('true', '1', 'yes')
+RSS_MAX_ITEM_AGE_HOURS = int(os.getenv('RSS_MAX_ITEM_AGE_HOURS', '48'))
+RSS_MAX_ITEMS_PER_POLL = int(os.getenv('RSS_MAX_ITEMS_PER_POLL', '10'))
+RSS_RETENTION_DAYS = int(os.getenv('RSS_STATE_RETENTION_DAYS', '90'))
+RSS_ALLOW_LIVE = os.getenv('RSS_ALLOW_LIVE', 'false').lower() in ('true', '1', 'yes')
+RSS_TOPIC_PER_FEED = os.getenv('RSS_TOPIC_PER_FEED', 'true').lower() in ('true', '1', 'yes')
+RSS_ARCHIVE_CHAT_ID = os.getenv('RSS_ARCHIVE_CHAT_ID') or None
+RSS_ARCHIVE_FORUM_CHAT_ID = os.getenv('RSS_ARCHIVE_FORUM_CHAT_ID') or None
+RSS_MAX_RETRIES = int(os.getenv('RSS_MAX_RETRIES', '0'))
+RSS_RETRY_BASE_SECONDS = int(os.getenv('RSS_RETRY_BASE_SECONDS', '900'))
+RSS_RETRY_MAX_DELAY_SECONDS = int(os.getenv('RSS_RETRY_MAX_DELAY_SECONDS', '21600'))
+RSS_LIVE_RECHECK_SECONDS = int(os.getenv('RSS_LIVE_RECHECK_SECONDS', '900'))
+YTDLP_COOKIES_FILE = os.getenv('YTDLP_COOKIES_FILE') or None
+YTDLP_CONCURRENT_FRAGMENTS = int(os.getenv('YTDLP_CONCURRENT_FRAGMENTS', '4'))
+YTDLP_RETRIES = int(os.getenv('YTDLP_RETRIES', '10'))
+YTDLP_HTTP_CHUNK_SIZE = int(os.getenv('YTDLP_HTTP_CHUNK_SIZE', str(10 * 1024 * 1024)))
+YTDLP_FORMAT = os.getenv('YTDLP_FORMAT', '').strip() or None
+
+# --- n8n Workflows (Dashboard-Buttons) ---
+def parse_n8n_webhooks(raw: str) -> dict[str, str]:
+    """Liest 'name=url,name=url' in ein Dict name -> Webhook-URL."""
+    hooks = {}
+    for entry in (raw or '').replace('\n', ',').split(','):
+        entry = entry.strip()
+        if not entry or '=' not in entry:
+            continue
+        name, url = entry.split('=', 1)
+        name, url = name.strip(), url.strip()
+        if name and url:
+            hooks[name] = url
+    return hooks
+
+N8N_WEBHOOKS = parse_n8n_webhooks(os.getenv('N8N_WEBHOOKS', ''))
+N8N_WEBHOOK_TIMEOUT = max(1, int(os.getenv('N8N_WEBHOOK_TIMEOUT', '10')))
+N8N_TRIGGER_COOLDOWN = max(0, int(os.getenv('N8N_TRIGGER_COOLDOWN', '10')))
 
 logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, FFmpeg-Threads: {FFMPEG_THREADS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS}, Inaktivitäts-Timeout: {DOWNLOAD_INACTIVITY_TIMEOUT}s)")
 
@@ -64,8 +110,37 @@ PLATFORM_ICONS = {
     'tiktok': '📱 TikTok',
     'twitch': '🟣 Twitch',
     'kick': '🟢 Kick',
-    'youtube': '🔴 YouTube'
+    'youtube': '🔴 YouTube',
+    'x': '✖️ X (Twitter)',
+    'twitter': '✖️ X (Twitter)',
+    'instagram': '📸 Instagram',
+    'facebook': '📘 Facebook',
+    'vimeo': '🎬 Vimeo',
+    'reddit': '👽 Reddit',
+    'streamable': '🎞 Streamable',
+    'odysee': '▶️ Odysee',
+    'rumble': '🟩 Rumble',
+    'bitchute': '📼 BitChute',
+    'dailymotion': '📺 Dailymotion',
+    'vk': '🇷🇺 VK',
+    'bilibili': '📺 Bilibili',
 }
+
+def escape_html(value) -> str:
+    return html.escape(str(value or ''), quote=False)
+
+def format_duration_seconds(seconds) -> str:
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return "N/A"
+    if total <= 0:
+        return "N/A"
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 class BotState:
     def __init__(self):
@@ -80,6 +155,7 @@ class BotState:
         self.pending_auth: dict = {}
         self.active_sessions: dict = {}
         self.sse_queues: set[asyncio.Queue] = set()
+        self.n8n_last_trigger: dict[str, float] = {}
 
 state = BotState()
 
@@ -103,8 +179,18 @@ mem_handler = MemoryLogHandler(state.log_buffer)
 mem_handler.setFormatter(logging.Formatter('%(message)s'))
 logger.addHandler(mem_handler)
 
-async def download_file(url: str, output_path: str, progress_callback=None, inactivity_timeout: int = DOWNLOAD_INACTIVITY_TIMEOUT):
-    logger.info(f"Starte Download von: {url[:80]}... nach {output_path} (Inaktivitäts-Timeout: {inactivity_timeout}s)")
+async def download_file(
+    url: str,
+    output_path: str,
+    progress_callback=None,
+    inactivity_timeout: int = DOWNLOAD_INACTIVITY_TIMEOUT,
+    chunk_size: int = DOWNLOAD_CHUNK_SIZE,
+):
+    chunk_size = max(64 * 1024, int(chunk_size))
+    logger.info(
+        f"Starte Download von: {url[:80]}... nach {output_path} "
+        f"(Inaktivitäts-Timeout: {inactivity_timeout}s, Chunk: {chunk_size // 1024} KB)"
+    )
     timeout = ClientTimeout(total=None, sock_read=inactivity_timeout, sock_connect=30)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -114,7 +200,7 @@ async def download_file(url: str, output_path: str, progress_callback=None, inac
     }
 
     try:
-        async with ClientSession(timeout=timeout) as session:
+        async with ClientSession(timeout=timeout, read_bufsize=chunk_size) as session:
             async with session.get(url, headers=headers) as response:
                 if response.status != 200:
                     raise Exception(f"Download fehlgeschlagen mit HTTP {response.status}")
@@ -125,7 +211,7 @@ async def download_file(url: str, output_path: str, progress_callback=None, inac
                 with open(output_path, 'wb') as f:
                     while True:
                         try:
-                            chunk = await asyncio.wait_for(response.content.read(512 * 1024), timeout=float(inactivity_timeout))
+                            chunk = await asyncio.wait_for(response.content.read(chunk_size), timeout=float(inactivity_timeout))
                         except (asyncio.TimeoutError, TimeoutError):
                             raise asyncio.TimeoutError(f"Inaktivitäts-Timeout: Seit {inactivity_timeout} Sekunden wurden keine Daten empfangen.")
 
@@ -338,36 +424,43 @@ async def split_video_to_parts(
 
     return verified_parts
 
-async def handle_upload(request):
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "Invalid JSON"}, status=400)
+async def process_job(data: dict) -> tuple[dict, int]:
+    """Verarbeitet einen Download-/Upload-Job.
 
+    Wird sowohl von ``/upload`` (n8n) als auch vom RSS-Archiv aufgerufen und
+    serialisiert alle Uploads über ``state.upload_lock``.
+    """
     download_url = data.get("download_url")
     if not download_url:
-        return web.json_response({"error": "Missing download_url"}, status=400)
+        return {"error": "Missing download_url"}, 400
 
     recording_id = str(data.get("recording_id", ""))
     job_id = recording_id or str(uuid.uuid4())[:8]
     streamer = data.get("streamer", "Unbekannt")
     title = data.get("title", "Livestream Recording")
+    source = str(data.get("source") or "streamrecorder")
+    use_ytdlp = bool(data.get("use_ytdlp"))
+    source_url = data.get("source_url")
 
     job_info = {
         "job_id": job_id,
         "streamer": streamer,
         "title": title,
+        "source": source,
         "queued_at": datetime.now().strftime("%H:%M:%S")
     }
     state.waiting_queue.append(job_info)
     state.waiting_count += 1
     in_queue = True
-    logger.info(f"[{job_id}] Request eingereiht ({streamer} - '{title}'). Wartende Jobs: {state.waiting_count}.")
+    logger.info(f"[{job_id}] Request eingereiht ({streamer} - '{title}', Quelle: {source}). Wartende Jobs: {state.waiting_count}.")
 
     job_dir = f"/tmp/job_{job_id}"
     os.makedirs(job_dir, exist_ok=True)
     temp_video = os.path.join(job_dir, f"stream_{job_id}.mp4")
     temp_thumb = os.path.join(job_dir, f"thumb_{job_id}.jpg") if data.get("thumbnail_url") else None
+    platform = str(data.get("platform") or "").lower()
+    actual_size_mb = 0
+    uploaded_message_ids = []
 
     try:
         async with state.upload_lock:
@@ -381,7 +474,7 @@ async def handle_upload(request):
             raw_chat_id = data.get("chat_id", DEFAULT_CHAT_ID)
             try:
                 chat_id = int(raw_chat_id)
-            except ValueError:
+            except (ValueError, TypeError):
                 chat_id = raw_chat_id
 
             raw_forum_chat_id = data.get("forum_chat_id", DEFAULT_FORUM_CHAT_ID)
@@ -389,27 +482,28 @@ async def handle_upload(request):
             if raw_forum_chat_id:
                 try:
                     forum_chat_id = int(raw_forum_chat_id)
-                except ValueError:
+                except (ValueError, TypeError):
                     forum_chat_id = raw_forum_chat_id
 
             duration = data.get("duration", "N/A")
             filesize_mb = data.get("filesize_mb", "N/A")
             thumbnail_url = data.get("thumbnail_url")
-            platform = data.get("platform", "").lower()
             category = data.get("category", "")
             max_viewers = data.get("max_viewers")
             avg_viewers = data.get("avg_viewers")
             deletion_time = data.get("deletion_time", "")
             recorded_at = data.get("recorded_at", "")
             formatted_date = format_recorded_at(recorded_at)
+            download_label = "Download aus RSS-Feed" if source == "rss" else "Download von Streamrecorder"
 
             state.active_job = {
                 "job_id": job_id,
                 "streamer": streamer,
                 "title": title,
                 "platform": platform,
+                "source": source,
                 "stage": "downloading",
-                "stage_label": "Download von Streamrecorder",
+                "stage_label": download_label,
                 "pct": 0,
                 "bytes_done": 0,
                 "bytes_total": 0,
@@ -443,21 +537,54 @@ async def handle_upload(request):
                     state.active_job['bytes_total'] = total
                     state.active_job['pct'] = int(done / total * 100) if total else 0
                     state.active_job['stage'] = 'downloading'
-                    state.active_job['stage_label'] = 'Download von Streamrecorder'
+                    state.active_job['stage_label'] = download_label
 
             try:
-                await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
+                if use_ytdlp:
+                    if state.active_job:
+                        state.active_job['stage_label'] = "Video-Analyse (yt-dlp)"
+                    temp_video = await rss_archiver.download_video(
+                        download_url,
+                        os.path.join(job_dir, f"stream_{job_id}"),
+                        progress_callback=dl_progress
+                    )
+                    logger.info(f"[{job_id}] yt-dlp-Download abgeschlossen: {os.path.basename(temp_video)}")
+                else:
+                    await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
+            except LiveStream as live_err:
+                logger.info(f"[{job_id}] {live_err}. Item bleibt für einen späteren Versuch vorgemerkt.")
+                if state.active_job and state.active_job.get("job_id") == job_id:
+                    state.active_job['stage'] = 'waiting'
+                    state.active_job['stage_label'] = str(live_err)
+                return {
+                    "status": "live",
+                    "job_id": job_id,
+                    "message": str(live_err)
+                }, 200
             except Exception as dl_err:
+                if use_ytdlp and is_live_error(dl_err):
+                    logger.info(f"[{job_id}] Live/Premiere erkannt ({dl_err}). Item bleibt für einen späteren Versuch vorgemerkt.")
+                    if state.active_job and state.active_job.get("job_id") == job_id:
+                        state.active_job['stage'] = 'waiting'
+                        state.active_job['stage_label'] = "Wartet auf Stream-Ende"
+                    return {
+                        "status": "live",
+                        "job_id": job_id,
+                        "message": str(dl_err)
+                    }, 200
                 logger.warning(f"[{job_id}] Download abgebrochen oder fehlgeschlagen ({dl_err}). Video wird übersprungen.")
                 if state.active_job and state.active_job.get("job_id") == job_id:
                     state.active_job['stage'] = 'skipped'
                     is_timeout = isinstance(dl_err, (asyncio.TimeoutError, TimeoutError)) or 'Inaktivitäts-Timeout' in str(dl_err)
                     state.active_job['stage_label'] = f"Übersprungen ({DOWNLOAD_INACTIVITY_TIMEOUT}s Timeout)" if is_timeout else "Übersprungen (Download fehlgeschlagen)"
-                return web.json_response({
+                return {
                     "status": "skipped",
                     "job_id": job_id,
                     "message": f"Download fehlgeschlagen ({dl_err}), Video übersprungen."
-                }, status=200)
+                }, 200
+
+            if not os.path.exists(temp_video):
+                return {"status": "skipped", "job_id": job_id, "message": "Download-Datei fehlt."}, 200
 
             actual_size = os.path.getsize(temp_video)
             actual_size_mb = round(actual_size / (1024 * 1024), 1)
@@ -465,6 +592,12 @@ async def handle_upload(request):
 
             platform_label = PLATFORM_ICONS.get(platform, f"🌐 {platform.capitalize() if platform else 'Stream'}")
             clean_streamer = "".join(c for c in streamer if c.isalnum() or c in ('_', '-')).strip() or "stream"
+            heading = "Neues RSS-Video" if source == "rss" else "Neues Stream-Recording"
+            person_label = "Kanal" if source == "rss" else "Streamer"
+            source_line = None
+            if source_url:
+                safe_source = html.escape(str(source_url), quote=True)
+                source_line = f'🔗 <b>Quelle:</b> <a href="{safe_source}">Original</a>'
             upload_files: list[tuple[str, str, str]] = []  # (file_path, caption, display_filename)
 
             # 3. Prüfen ob Aufteilung nötig (> 1.8 GB)
@@ -479,21 +612,23 @@ async def handle_upload(request):
 
                 # Teil 1 mit allen Infos/Stats
                 caption_lines = [
-                    f"🎥 <b>Neues Stream-Recording (Teil 1/{total_parts})</b>\n",
-                    f"👤 <b>Streamer:</b> {streamer}",
-                    f"📌 <b>Titel:</b> {title}"
+                    f"🎥 <b>{heading} (Teil 1/{total_parts})</b>\n",
+                    f"👤 <b>{person_label}:</b> {escape_html(streamer)}",
+                    f"📌 <b>Titel:</b> {escape_html(title)}"
                 ]
                 if category:
-                    caption_lines.append(f"🎮 <b>Kategorie:</b> {category} | {platform_label}")
+                    caption_lines.append(f"🎮 <b>Kategorie:</b> {escape_html(category)} | {platform_label}")
                 else:
                     caption_lines.append(f"📡 <b>Plattform:</b> {platform_label}")
 
                 caption_lines.append("")
                 if formatted_date:
-                    caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
-                caption_lines.append(f"⏱ <b>Gesamtdauer:</b> {duration}")
+                    caption_lines.append(f"📅 <b>Datum:</b> {escape_html(formatted_date)}")
+                caption_lines.append(f"⏱ <b>Gesamtdauer:</b> {escape_html(duration)}")
                 caption_lines.append(f"💾 <b>Gesamtgröße:</b> {actual_size_mb} MB ({total_parts} Teile)")
-                caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
+                caption_lines.append(f"🆔 <b>ID:</b> <code>{escape_html(recording_id)}</code>")
+                if source_line:
+                    caption_lines.append(source_line)
                 main_caption = "\n".join(caption_lines)
                 display_filename_1 = f"{clean_streamer}_{job_id}_part01.mp4"
                 upload_files.append((split_parts[0], main_caption, display_filename_1))
@@ -501,33 +636,37 @@ async def handle_upload(request):
                 # Teil 2..N nummeriert
                 for idx, part_path in enumerate(split_parts[1:], start=2):
                     sub_caption_lines = [
-                        f"🎥 <b>Neues Stream-Recording (Teil {idx}/{total_parts})</b>\n",
-                        f"👤 <b>Streamer:</b> {streamer}",
-                        f"📌 <b>Titel:</b> {title}"
+                        f"🎥 <b>{heading} (Teil {idx}/{total_parts})</b>\n",
+                        f"👤 <b>{person_label}:</b> {escape_html(streamer)}",
+                        f"📌 <b>Titel:</b> {escape_html(title)}"
                     ]
                     if formatted_date:
-                        sub_caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
-                    sub_caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
+                        sub_caption_lines.append(f"📅 <b>Datum:</b> {escape_html(formatted_date)}")
+                    sub_caption_lines.append(f"🆔 <b>ID:</b> <code>{escape_html(recording_id)}</code>")
+                    if source_line:
+                        sub_caption_lines.append(source_line)
                     sub_caption = "\n".join(sub_caption_lines)
                     display_filename_n = f"{clean_streamer}_{job_id}_part{idx:02d}.mp4"
                     upload_files.append((part_path, sub_caption, display_filename_n))
             else:
                 caption_lines = [
-                    f"🎥 <b>Neues Stream-Recording</b>\n",
-                    f"👤 <b>Streamer:</b> {streamer}",
-                    f"📌 <b>Titel:</b> {title}"
+                    f"🎥 <b>{heading}</b>\n",
+                    f"👤 <b>{person_label}:</b> {escape_html(streamer)}",
+                    f"📌 <b>Titel:</b> {escape_html(title)}"
                 ]
                 if category:
-                    caption_lines.append(f"🎮 <b>Kategorie:</b> {category} | {platform_label}")
+                    caption_lines.append(f"🎮 <b>Kategorie:</b> {escape_html(category)} | {platform_label}")
                 else:
                     caption_lines.append(f"📡 <b>Plattform:</b> {platform_label}")
 
                 caption_lines.append("")
                 if formatted_date:
-                    caption_lines.append(f"📅 <b>Datum:</b> {formatted_date}")
-                caption_lines.append(f"⏱ <b>Dauer:</b> {duration}")
+                    caption_lines.append(f"📅 <b>Datum:</b> {escape_html(formatted_date)}")
+                caption_lines.append(f"⏱ <b>Dauer:</b> {escape_html(duration)}")
                 caption_lines.append(f"💾 <b>Größe:</b> {actual_size_mb} MB")
-                caption_lines.append(f"🆔 <b>ID:</b> <code>{recording_id}</code>")
+                caption_lines.append(f"🆔 <b>ID:</b> <code>{escape_html(recording_id)}</code>")
+                if source_line:
+                    caption_lines.append(source_line)
                 caption = "\n".join(caption_lines)
                 display_filename_single = f"{clean_streamer}_{job_id}.mp4"
                 upload_files.append((temp_video, caption, display_filename_single))
@@ -660,7 +799,7 @@ async def handle_upload(request):
             # 5. Direkt auf Streamrecorder als 'downloaded' markieren (falls Cookie vorhanden)
             raw_cookie = data.get("cookie") or os.getenv("STREAMRECORDER_COOKIE")
             sr_cookie = sanitize_cookie(raw_cookie)
-            if sr_cookie and recording_id:
+            if source != "rss" and sr_cookie and recording_id:
                 try:
                     mark_url = f"https://streamrecorder.io/api/user/setdownloaded?fileid={recording_id}"
                     headers = {
@@ -681,6 +820,7 @@ async def handle_upload(request):
                     "streamer": streamer,
                     "title": title,
                     "platform": platform,
+                    "source": source,
                     "parts": len(uploaded_message_ids),
                     "total_size_mb": actual_size_mb,
                     "topic_id": target_topic_id,
@@ -690,7 +830,7 @@ async def handle_upload(request):
                 })
                 state.active_job = None
 
-            return web.json_response({
+            return {
                 "status": "success",
                 "message_id": uploaded_message_ids[0],
                 "message_ids": uploaded_message_ids,
@@ -699,7 +839,7 @@ async def handle_upload(request):
                 "forum_chat_id": forum_chat_id,
                 "topic_id": target_topic_id,
                 "forwarded_message_ids": forum_message_ids
-            })
+            }, 200
 
     except Exception as e:
         logger.error(f"[{job_id}] Fehler bei Verarbeitung: {e}", exc_info=True)
@@ -708,9 +848,10 @@ async def handle_upload(request):
                 "job_id": job_id,
                 "streamer": streamer,
                 "title": title,
-                "platform": platform if 'platform' in locals() else "",
-                "parts": len(uploaded_message_ids) if 'uploaded_message_ids' in locals() else 0,
-                "total_size_mb": actual_size_mb if 'actual_size_mb' in locals() else 0,
+                "platform": platform,
+                "source": source,
+                "parts": len(uploaded_message_ids),
+                "total_size_mb": actual_size_mb,
                 "topic_id": None,
                 "topic_name": None,
                 "status": "failed",
@@ -718,7 +859,7 @@ async def handle_upload(request):
                 "finished_at": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             })
             state.active_job = None
-        return web.json_response({"error": str(e)}, status=500)
+        return {"error": str(e)}, 500
 
     finally:
         if in_queue:
@@ -735,6 +876,150 @@ async def handle_upload(request):
             logger.warning(f"[{job_id}] Konnte Job-Verzeichnis {job_dir} nicht löschen: {e}")
 
 
+async def handle_upload(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    payload, status = await process_job(data)
+    return web.json_response(payload, status=status)
+
+
+async def archive_rss_item(item: RssItem) -> dict:
+    """Baut aus einem Feed-Item einen Job fuer die bestehende Upload-Pipeline."""
+    duration = format_duration_seconds(item.duration) if item.duration else "N/A"
+    job_data = {
+        "download_url": item.url,
+        "use_ytdlp": True,
+        "source": "rss",
+        "source_url": item.url,
+        "recording_id": item.recording_id,
+        "streamer": item.channel,
+        "title": item.title,
+        "thumbnail_url": item.thumbnail,
+        "platform": item.platform,
+        "recorded_at": item.published_iso,
+        "duration": duration,
+        "chat_id": RSS_ARCHIVE_CHAT_ID or DEFAULT_CHAT_ID,
+        "forum_chat_id": RSS_ARCHIVE_FORUM_CHAT_ID or DEFAULT_FORUM_CHAT_ID,
+        "topic_name": item.channel if RSS_TOPIC_PER_FEED else None,
+    }
+    payload, status = await process_job(job_data)
+    if status >= 400:
+        raise RuntimeError(payload.get("error") or f"HTTP {status}")
+    return payload
+
+
+rss_archiver = RssArchiver(
+    on_item=archive_rss_item,
+    state_file=RSS_STATE_FILE,
+    opml_file=RSS_OPML_FILE or None,
+    feed_urls=RSS_FEED_URLS,
+    feed_titles=RSS_FEED_TITLES,
+    interval=RSS_POLL_INTERVAL,
+    initial_backfill=RSS_INITIAL_BACKFILL,
+    max_item_age_hours=RSS_MAX_ITEM_AGE_HOURS,
+    max_items_per_poll=RSS_MAX_ITEMS_PER_POLL,
+    max_retries=RSS_MAX_RETRIES,
+    retry_base_seconds=RSS_RETRY_BASE_SECONDS,
+    retry_max_delay_seconds=RSS_RETRY_MAX_DELAY_SECONDS,
+    live_recheck_seconds=RSS_LIVE_RECHECK_SECONDS,
+    retention_days=RSS_RETENTION_DAYS,
+    allow_live=RSS_ALLOW_LIVE,
+    cookies_file=YTDLP_COOKIES_FILE,
+    enabled=RSS_ENABLED,
+    ytdlp_concurrent_fragments=YTDLP_CONCURRENT_FRAGMENTS,
+    ytdlp_retries=YTDLP_RETRIES,
+    ytdlp_http_chunk_size=YTDLP_HTTP_CHUNK_SIZE,
+    ytdlp_format=YTDLP_FORMAT,
+)
+
+
+async def handle_rss_status(request):
+    return web.json_response(rss_archiver.status())
+
+
+async def handle_rss_check(request):
+    if not RSS_ENABLED:
+        return web.json_response({"status": "disabled"}, status=503)
+    started = rss_archiver.trigger()
+    return web.json_response(
+        {"status": "started" if started else "busy"},
+        status=202 if started else 409,
+    )
+
+
+async def handle_rss_backfill(request):
+    if not RSS_ENABLED:
+        return web.json_response({"status": "disabled"}, status=503)
+    try:
+        limit = int(request.query.get("limit", "10"))
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+    started = rss_archiver.trigger_backfill(limit)
+    return web.json_response(
+        {"status": "started" if started else "busy", "limit": limit},
+        status=202 if started else 409,
+    )
+
+
+async def handle_n8n_run(request):
+    """Startet einen (oder alle) n8n-Workflow(s) ueber deren Webhook-Trigger."""
+    if not get_authed_session(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    if not N8N_WEBHOOKS:
+        return web.json_response({"status": "disabled"}, status=503)
+
+    name = (request.query.get("name") or "").strip()
+    if name and name not in N8N_WEBHOOKS:
+        return web.json_response(
+            {"error": "Unknown workflow", "available": sorted(N8N_WEBHOOKS)},
+            status=404,
+        )
+
+    targets = [name] if name else list(N8N_WEBHOOKS)
+    now = time.time()
+    results = []
+    timeout = ClientTimeout(total=N8N_WEBHOOK_TIMEOUT)
+
+    async with ClientSession(timeout=timeout) as session:
+        for target in targets:
+            last = state.n8n_last_trigger.get(target, 0.0)
+            if N8N_TRIGGER_COOLDOWN and (now - last) < N8N_TRIGGER_COOLDOWN:
+                results.append({"name": target, "ok": False, "status": "cooldown"})
+                continue
+            state.n8n_last_trigger[target] = now
+            try:
+                async with session.post(N8N_WEBHOOKS[target]) as resp:
+                    body = await resp.text()
+                    ok = resp.status < 400
+                    logger.info(f"n8n-Workflow '{target}' gestartet (HTTP {resp.status})")
+                    results.append({
+                        "name": target,
+                        "ok": ok,
+                        "http_status": resp.status,
+                        "response": body[:200],
+                    })
+            except asyncio.TimeoutError:
+                logger.warning(f"n8n-Workflow '{target}': Timeout nach {N8N_WEBHOOK_TIMEOUT}s")
+                results.append({"name": target, "ok": False, "status": "timeout"})
+            except Exception as exc:
+                logger.warning(f"n8n-Workflow '{target}' fehlgeschlagen: {exc}")
+                results.append({"name": target, "ok": False, "status": "error"})
+
+    started = [r for r in results if r["ok"]]
+    if not started:
+        status = 429 if all(r.get("status") == "cooldown" for r in results) else 502
+        return web.json_response({"status": "failed", "workflows": results}, status=status)
+
+    return web.json_response(
+        {"status": "started", "workflows": results},
+        status=202,
+    )
+
+
 async def handle_health(request):
     is_busy = state.upload_lock.locked()
     return web.json_response({
@@ -747,24 +1032,321 @@ async def handle_health(request):
         "parallel_workers": PARALLEL_WORKERS,
         "chat_id": DEFAULT_CHAT_ID,
         "forum_chat_id": DEFAULT_FORUM_CHAT_ID,
-        "forward_drop_author": FORWARD_DROP_AUTHOR
+        "forward_drop_author": FORWARD_DROP_AUTHOR,
+        "rss": rss_archiver.summary()
     })
 
 # --- Dashboard & Telegram Authentication Handlers ---
 
-async def handle_dashboard_page(request):
+def get_authed_session(request):
+    """Gibt die aktive Dashboard-Session zurück oder None."""
     session_id = request.cookies.get("vod_session")
-    is_authed = False
-    if session_id and session_id in state.active_sessions:
-        if time.time() <= state.active_sessions[session_id].get("expires_at", 0):
-            is_authed = True
-        else:
-            del state.active_sessions[session_id]
+    if not session_id:
+        return None
+    session = state.active_sessions.get(session_id)
+    if not session:
+        return None
+    if time.time() > session.get("expires_at", 0):
+        state.active_sessions.pop(session_id, None)
+        return None
+    return session
 
-    if is_authed:
-        return web.Response(text=DASHBOARD_HTML, content_type='text/html')
+
+def count_mapped_topics() -> int:
+    """Anzahl eindeutiger Topic-IDs über alle Chats im Cache."""
+    topic_ids = set()
+    for chat_topics in topic_manager.cache.values():
+        if isinstance(chat_topics, dict):
+            topic_ids.update(
+                tid for tid in chat_topics.values()
+                if isinstance(tid, int) and not isinstance(tid, bool)
+            )
+    return len(topic_ids)
+
+
+# --- Topic-Verwaltung ---
+
+def _json_error(message: str, status: int = 400):
+    return web.json_response({"error": message}, status=status)
+
+
+def topic_chat_ids() -> list[str]:
+    chats = [
+        str(key) for key, value in topic_manager.cache.items()
+        if isinstance(value, dict)
+    ]
+    configured = str(DEFAULT_FORUM_CHAT_ID).strip() if DEFAULT_FORUM_CHAT_ID else ""
+    if configured and configured not in chats:
+        chats.insert(0, configured)
+    return chats
+
+
+def resolve_topic_chat(raw=None) -> str:
+    configured = str(DEFAULT_FORUM_CHAT_ID).strip() if DEFAULT_FORUM_CHAT_ID else ""
+    candidate = str(raw).strip() if raw not in (None, "") else ""
+    chats = topic_chat_ids()
+    if candidate:
+        if candidate in chats or candidate == configured:
+            return candidate
+        raise ValueError("Unbekannter Chat.")
+    if configured:
+        return configured
+    if chats:
+        return chats[0]
+    raise ValueError("Kein Forum-Chat konfiguriert.")
+
+
+def validate_topic_name(value) -> str:
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("Name darf nicht leer sein.")
+    if len(name) > 128:
+        raise ValueError("Name ist zu lang (max. 128 Zeichen).")
+    return name
+
+
+def find_alias(chat_id: str, name: str) -> str | None:
+    """Sucht einen Alias case-insensitiv (wie das Smart-Matching des Bots)."""
+    target = str(name or "").strip().casefold()
+    for alias in topic_manager.list_topics(chat_id):
+        if alias.strip().casefold() == target:
+            return alias
+    return None
+
+
+def parse_topic_id(value) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Topic-ID muss eine positive Ganzzahl sein.")
+    if isinstance(value, int):
+        topic_id = value
     else:
-        return web.Response(text=LOGIN_HTML, content_type='text/html')
+        text = str(value or "").strip()
+        if not text.isdigit():
+            raise ValueError("Topic-ID muss eine positive Ganzzahl sein.")
+        topic_id = int(text)
+    if topic_id <= 0:
+        raise ValueError("Topic-ID muss eine positive Ganzzahl sein.")
+    return topic_id
+
+
+def choose_topic_display_name(aliases: list[str]) -> str:
+    """Wählt einen möglichst lesbaren Alias als Anzeigenamen der Gruppe."""
+    def score(alias: str) -> int:
+        points = 0
+        if not alias.startswith('@'):
+            points += 2
+        if not alias.startswith('_'):
+            points += 1
+        if not alias.isdigit():
+            points += 2
+        if ' ' in alias:
+            points += 1
+        if any(ch.isupper() for ch in alias):
+            points += 1
+        if '.' in alias:
+            points -= 1
+        return points
+
+    return sorted(aliases, key=lambda a: (-score(a), len(a), a.lower()))[0]
+
+
+def build_topics_payload(chat_id: str) -> dict:
+    groups: dict[int, list[str]] = {}
+    for alias, topic_id in topic_manager.list_topics(chat_id).items():
+        groups.setdefault(topic_id, []).append(alias)
+
+    topics = []
+    for topic_id, aliases in groups.items():
+        aliases = sorted(aliases, key=lambda a: a.lower())
+        topics.append({
+            "topic_id": topic_id,
+            "name": choose_topic_display_name(aliases),
+            "aliases": aliases,
+            "link": f"https://t.me/RippersArchiv/{topic_id}",
+        })
+    topics.sort(key=lambda row: row["name"].lower())
+
+    return {
+        "chat_id": chat_id,
+        "chats": topic_chat_ids(),
+        "forum_chat_id": str(DEFAULT_FORUM_CHAT_ID).strip() if DEFAULT_FORUM_CHAT_ID else "",
+        "topics": topics,
+        "alias_count": sum(len(row["aliases"]) for row in topics),
+    }
+
+
+async def handle_topics_page(request):
+    if not get_authed_session(request):
+        raise web.HTTPFound('/voduploader')
+    return web.Response(text=TOPICS_HTML, content_type='text/html')
+
+
+async def handle_topics_list(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        chat_id = resolve_topic_chat(request.query.get('chat_id'))
+    except ValueError as exc:
+        return _json_error(str(exc))
+    return web.json_response(build_topics_payload(chat_id))
+
+
+async def handle_topic_create(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_error("Ungültige Anfrage.")
+    if not isinstance(data, dict):
+        return _json_error("JSON-Objekt erwartet.")
+
+    try:
+        chat_id = resolve_topic_chat(data.get('chat_id'))
+        name = validate_topic_name(data.get('name'))
+        create_raw = data.get('create')
+        create_in_telegram = (
+            create_raw is True or str(create_raw).strip().lower() in ('true', '1', 'yes')
+        )
+
+        existing_alias = find_alias(chat_id, name)
+        existing_topic_id = (
+            topic_manager.list_topics(chat_id).get(existing_alias)
+            if existing_alias is not None else None
+        )
+
+        if create_in_telegram:
+            if existing_alias is not None:
+                return _json_error(
+                    f"Der Name '{existing_alias}' existiert bereits "
+                    f"(Topic {existing_topic_id}). Bitte einen anderen Namen wählen.",
+                    409,
+                )
+            if not state.telegram_client:
+                return _json_error("Telegram-Client ist noch nicht verbunden.", 503)
+            topic_id = await topic_manager.create_topic(
+                state.telegram_client, chat_id, name
+            )
+        else:
+            topic_id = parse_topic_id(data.get('topic_id'))
+            if existing_alias is not None and existing_topic_id != topic_id:
+                return _json_error(
+                    f"Der Name '{existing_alias}' ist bereits dem Topic "
+                    f"{existing_topic_id} zugeordnet.",
+                    409,
+                )
+            topic_manager.add_alias(chat_id, name, topic_id)
+    except ValueError as exc:
+        return _json_error(str(exc))
+    except Exception as exc:
+        logger.error(f"Topic konnte nicht erstellt werden: {exc}", exc_info=True)
+        return _json_error(f"Topic konnte nicht erstellt werden: {exc}", 502)
+
+    logger.info(f"Topic-Verwaltung: '{name}' -> Topic {topic_id} hinzugefügt.")
+    return web.json_response({"status": "ok", "topic_id": topic_id})
+
+
+async def handle_topic_update(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_error("Ungültige Anfrage.")
+    if not isinstance(data, dict):
+        return _json_error("JSON-Objekt erwartet.")
+
+    try:
+        chat_id = resolve_topic_chat(data.get('chat_id'))
+        old_topic_id = parse_topic_id(data.get('topic_id'))
+        new_topic_id = parse_topic_id(data.get('new_topic_id'))
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    existing_ids = set(topic_manager.list_topics(chat_id).values())
+    if old_topic_id not in existing_ids:
+        return _json_error("Topic nicht gefunden.", 404)
+    if new_topic_id != old_topic_id and new_topic_id in existing_ids:
+        return _json_error(
+            f"Topic-ID {new_topic_id} existiert bereits. Bitte zuerst die andere Gruppe löschen.",
+            409,
+        )
+
+    changed = topic_manager.remap_topic(chat_id, old_topic_id, new_topic_id)
+    logger.info(
+        f"Topic-Verwaltung: Topic {old_topic_id} -> {new_topic_id} "
+        f"({changed} Alias(e) aktualisiert)."
+    )
+    return web.json_response({"status": "ok", "changed": changed})
+
+
+async def handle_topic_delete(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        chat_id = resolve_topic_chat(request.query.get('chat_id'))
+        topic_id = parse_topic_id(request.query.get('topic_id'))
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    removed = topic_manager.delete_topic(chat_id, topic_id)
+    if not removed:
+        return _json_error("Topic nicht gefunden.", 404)
+    logger.info(f"Topic-Verwaltung: Topic {topic_id} mit {removed} Alias(en) gelöscht.")
+    return web.json_response({"status": "ok", "removed": removed})
+
+
+async def handle_topic_alias_create(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        data = await request.json()
+    except Exception:
+        return _json_error("Ungültige Anfrage.")
+    if not isinstance(data, dict):
+        return _json_error("JSON-Objekt erwartet.")
+
+    try:
+        chat_id = resolve_topic_chat(data.get('chat_id'))
+        name = validate_topic_name(data.get('name'))
+        topic_id = parse_topic_id(data.get('topic_id'))
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    existing_alias = find_alias(chat_id, name)
+    existing = (
+        topic_manager.list_topics(chat_id).get(existing_alias)
+        if existing_alias is not None else None
+    )
+    if existing is not None and existing != topic_id:
+        return _json_error(
+            f"Der Name '{existing_alias}' ist bereits dem Topic {existing} zugeordnet.",
+            409,
+        )
+    topic_manager.add_alias(chat_id, name, topic_id)
+    logger.info(f"Topic-Verwaltung: Alias '{name}' -> Topic {topic_id} hinzugefügt.")
+    return web.json_response({"status": "ok"})
+
+
+async def handle_topic_alias_delete(request):
+    if not get_authed_session(request):
+        return _json_error("Unauthorized", 401)
+    try:
+        chat_id = resolve_topic_chat(request.query.get('chat_id'))
+        name = validate_topic_name(request.query.get('name'))
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    if not topic_manager.remove_alias(chat_id, name):
+        return _json_error("Alias nicht gefunden.", 404)
+    logger.info(f"Topic-Verwaltung: Alias '{name}' entfernt.")
+    return web.json_response({"status": "ok"})
+
+
+async def handle_dashboard_page(request):
+    if get_authed_session(request):
+        return web.Response(text=DASHBOARD_HTML, content_type='text/html')
+    return web.Response(text=LOGIN_HTML, content_type='text/html')
 
 async def handle_auth_request(request):
     token = secrets.token_hex(12)
@@ -816,16 +1398,11 @@ async def handle_logout(request):
     return resp
 
 async def handle_dashboard_status(request):
-    session_id = request.cookies.get("vod_session")
-    if not session_id or session_id not in state.active_sessions:
+    session = get_authed_session(request)
+    if not session:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    session = state.active_sessions[session_id]
-    if time.time() > session.get("expires_at", 0):
-        del state.active_sessions[session_id]
-        return web.json_response({"error": "Session expired"}, status=401)
-
-    topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+    topic_count = count_mapped_topics()
     return web.json_response({
         "user": session.get("user", "Admin"),
         "queue_count": len(state.waiting_queue),
@@ -833,18 +1410,15 @@ async def handle_dashboard_status(request):
         "active_job": state.active_job,
         "queue": list(state.waiting_queue),
         "history": list(state.history),
-        "logs": list(state.log_buffer)
+        "logs": list(state.log_buffer),
+        "rss": rss_archiver.status(),
+        "n8n_workflows": sorted(N8N_WEBHOOKS)
     })
 
 async def handle_dashboard_events(request):
-    session_id = request.cookies.get("vod_session")
-    if not session_id or session_id not in state.active_sessions:
+    session = get_authed_session(request)
+    if not session:
         return web.Response(status=401, text="Unauthorized")
-
-    session = state.active_sessions[session_id]
-    if time.time() > session.get("expires_at", 0):
-        del state.active_sessions[session_id]
-        return web.Response(status=401, text="Session expired")
 
     response = web.StreamResponse(
         status=200,
@@ -862,7 +1436,7 @@ async def handle_dashboard_events(request):
     state.sse_queues.add(queue)
 
     try:
-        topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+        topic_count = count_mapped_topics()
         init_data = {
             "user": session.get("user", "Admin"),
             "queue_count": len(state.waiting_queue),
@@ -870,13 +1444,15 @@ async def handle_dashboard_events(request):
             "active_job": state.active_job,
             "queue": list(state.waiting_queue),
             "history": list(state.history),
-            "logs": list(state.log_buffer)
+            "logs": list(state.log_buffer),
+            "rss": rss_archiver.status(),
+            "n8n_workflows": sorted(N8N_WEBHOOKS)
         }
         await response.write(f"data: {json.dumps(init_data, ensure_ascii=False)}\n\n".encode('utf-8'))
 
         while True:
             await asyncio.sleep(1.5)
-            topic_count = sum(len(v) for v in topic_manager.cache.values() if isinstance(v, dict))
+            topic_count = count_mapped_topics()
             data = {
                 "user": session.get("user", "Admin"),
                 "queue_count": len(state.waiting_queue),
@@ -884,7 +1460,9 @@ async def handle_dashboard_events(request):
                 "active_job": state.active_job,
                 "queue": list(state.waiting_queue),
                 "history": list(state.history),
-                "logs": list(state.log_buffer)
+                "logs": list(state.log_buffer),
+                "rss": rss_archiver.status(),
+                "n8n_workflows": sorted(N8N_WEBHOOKS)
             }
             await response.write(f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8'))
     except (asyncio.CancelledError, ConnectionResetError):
@@ -900,6 +1478,24 @@ async def on_startup(app):
     me = await state.telegram_client.get_me()
     state.bot_username = getattr(me, 'username', '') or ''
     logger.info(f"Telegram Bot @{state.bot_username} Client und Queue-Lock erfolgreich gestartet!")
+
+    if RSS_ENABLED:
+        rss_archiver.start()
+        logger.info(
+            "RSS-Archiv aktiviert (OPML: %s, Feed-URLs: %d, Feed-Filter: %s, Intervall: %ss, "
+            "Retries: %s, Retry-Backoff: %ss-%ss, Live-Recheck: %ss, yt-dlp-Fragmente: %d).",
+            RSS_OPML_FILE or "-",
+            len(RSS_FEED_URLS),
+            ", ".join(RSS_FEED_TITLES) if RSS_FEED_TITLES else "alle Feeds",
+            RSS_POLL_INTERVAL,
+            "unbegrenzt" if RSS_MAX_RETRIES <= 0 else RSS_MAX_RETRIES,
+            RSS_RETRY_BASE_SECONDS,
+            RSS_RETRY_MAX_DELAY_SECONDS,
+            RSS_LIVE_RECHECK_SECONDS,
+            YTDLP_CONCURRENT_FRAGMENTS,
+        )
+    else:
+        logger.info("RSS-Archiv ist deaktiviert (RSS_ENABLED=false).")
 
     # Registriere Telegram Bot Chat Event-Handler für Option B Dashboard Auth
     @state.telegram_client.on(events.NewMessage(pattern=r'^/start(?:\s+login_([a-zA-Z0-9_-]+))?'))
@@ -982,6 +1578,7 @@ async def on_startup(app):
             await event.answer("Abgelehnt")
 
 async def on_cleanup(app):
+    rss_archiver.stop()
     if state.telegram_client:
         await state.telegram_client.disconnect()
         logger.info("Telegram Bot Client getrennt.")
@@ -990,6 +1587,17 @@ def create_app():
     app = web.Application()
     app.router.add_post('/upload', handle_upload)
     app.router.add_get('/health', handle_health)
+    app.router.add_post('/rss/check', handle_rss_check)
+    app.router.add_get('/rss/status', handle_rss_status)
+    app.router.add_post('/rss/backfill', handle_rss_backfill)
+    # Alias unter dem Traefik-Prefix, damit das Dashboard den Endpunkt erreicht.
+    app.router.add_post('/voduploader/rss/check', handle_rss_check)
+    app.router.add_get('/voduploader/rss/status', handle_rss_status)
+    app.router.add_post('/voduploader/rss/backfill', handle_rss_backfill)
+
+    # n8n-Workflow-Trigger (Dashboard-Buttons)
+    app.router.add_post('/n8n/run', handle_n8n_run)
+    app.router.add_post('/voduploader/n8n/run', handle_n8n_run)
 
     # Dashboard & Auth Endpunkte
     app.router.add_get('/voduploader', handle_dashboard_page)
@@ -999,6 +1607,16 @@ def create_app():
     app.router.add_post('/voduploader/api/logout', handle_logout)
     app.router.add_get('/voduploader/api/status', handle_dashboard_status)
     app.router.add_get('/voduploader/api/events', handle_dashboard_events)
+
+    # Topic-Verwaltung
+    app.router.add_get('/voduploader/topics', handle_topics_page)
+    app.router.add_get('/voduploader/topics/', handle_topics_page)
+    app.router.add_get('/voduploader/api/topics', handle_topics_list)
+    app.router.add_post('/voduploader/api/topics', handle_topic_create)
+    app.router.add_patch('/voduploader/api/topics', handle_topic_update)
+    app.router.add_delete('/voduploader/api/topics', handle_topic_delete)
+    app.router.add_post('/voduploader/api/topics/alias', handle_topic_alias_create)
+    app.router.add_delete('/voduploader/api/topics/alias', handle_topic_alias_delete)
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
