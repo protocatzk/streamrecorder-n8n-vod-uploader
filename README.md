@@ -132,6 +132,7 @@ Die wichtigsten Variablen:
 | `POST` | `/rss/backfill?limit=10` | Die neuesten N bestehenden Videos nacharchivieren |
 | `GET` | `/rss/status` | Feed-Status, Zaehler, Fehler |
 | `POST` | `/n8n/run?name=<key>` | n8n-Workflow per Webhook starten (Dashboard-Session noetig) |
+| `POST` | `/voduploader/api/jobs/cancel` | Wartenden/laufenden Job abbrechen (`{"key": "..."}`) |
 | `GET` | `/voduploader` | Dashboard |
 | `GET` | `/voduploader/topics` | Topic-Verwaltung |
 
@@ -145,6 +146,9 @@ Unter dem Traefik-Prefix existieren dieselben Endpunkte zusaetzlich als
   Zugriff.
 - **Aktiver Upload / Queue / Historie / Logs** werden per Server-Sent-Events
   live aktualisiert.
+- **Jobs abbrechen**: Der aktive Job und jeder Queue-Eintrag haben einen
+  Abbrechen-Button. Bereits gesendete Telegram-Teile werden geloescht, der Job
+  wird nicht fortgesetzt (siehe `vod-uploader/README.md`).
 - **RSS-Archiv**: Feed-Status, Zaehler und Buttons *Jetzt pruefen* /
   *10 nachholen*.
 - **n8n-Workflows**: Karten mit einem Button pro Account; sichtbar, sobald
@@ -262,7 +266,9 @@ mitgeliefert.
     ├── job_store.py           # persistenter Job-Spool mit Resume
     ├── rss_archiver.py        # rss.app-Polling und yt-dlp-Download
     ├── topic_manager.py       # Forum-Topics und Alias-Cache
-    ├── dashboard_templates.py # HTML/CSS/JS des Dashboards
+    ├── template_loader.py     # laedt HTML-Templates aus templates/
+    ├── templates/             # login.html, dashboard.html, topics.html
+    ├── static/                # CSS/JS des Dashboards
     ├── Dockerfile
     ├── docker-compose.yml
     ├── requirements.txt
@@ -280,4 +286,5 @@ mitgeliefert.
 | n8n-Button liefert `Nicht verfuegbar` | `N8N_WEBHOOKS` leer oder Webhook im Workflow nicht aktiv |
 | `202 duplicate` im n8n-Log | Job laeuft bereits oder wurde bereits hochgeladen (gewollt) |
 | Upload haengt nach Neustart | Log auf `Setze gespeicherten Job fort` pruefen; Teile mit Message-ID werden uebersprungen |
+| Queue haengt an einem Job | Im Dashboard abbrechen (Button am aktiven Job); Details siehe `vod-uploader/README.md` |
 | Splitting schlaegt fehl | FFmpeg-Meldung im Log; Job-Verzeichnis in `state_data/jobs/<key>` pruefen |

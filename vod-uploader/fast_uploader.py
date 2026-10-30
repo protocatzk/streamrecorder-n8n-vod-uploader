@@ -115,12 +115,28 @@ class ParallelTransferrer:
         self.upload_ticker = (self.upload_ticker + 1) % len(self.senders)
 
     async def finish_upload(self) -> None:
-        if self.senders:
-            await asyncio.gather(*[sender.disconnect() for sender in self.senders], return_exceptions=True)
-            self.senders = []
+        senders, self.senders = self.senders, []
+        pending = [sender.previous for sender in senders if sender.previous is not None]
+        for sender in senders:
+            sender.previous = None
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if senders:
+            await asyncio.gather(*[sender.disconnect() for sender in senders], return_exceptions=True)
 
     async def cleanup(self) -> None:
-        await self.finish_upload()
+        """Bricht offene Chunk-Tasks ab und schliesst alle Sender (auch bei Abbruch)."""
+        senders, self.senders = self.senders, []
+        pending = [sender.previous for sender in senders if sender.previous is not None]
+        for sender in senders:
+            sender.previous = None
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if senders:
+            await asyncio.gather(*[sender.disconnect() for sender in senders], return_exceptions=True)
 
 
 async def fast_upload_file(
@@ -168,9 +184,9 @@ async def fast_upload_file(
             return InputFileBig(file_id, part_count, file_name)
         else:
             return InputFile(file_id, part_count, file_name, hash_md5.hexdigest())
-    except Exception as e:
+    finally:
+        # Auch bei CancelledError (BaseException) alle Sender sauber schliessen.
         await uploader.cleanup()
-        raise e
 
 
 def parse_duration_to_seconds(d_val) -> float | None:

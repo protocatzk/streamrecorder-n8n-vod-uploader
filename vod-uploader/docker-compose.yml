@@ -47,6 +47,7 @@ services:
       - STATE_DIR
       - JOB_DONE_TTL_DAYS
       - JOB_STALE_DAYS
+      - JOB_CANCEL_FORCE_AFTER_SECONDS
     deploy:
       resources:
         limits:

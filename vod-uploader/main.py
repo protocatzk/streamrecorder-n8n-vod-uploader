@@ -151,6 +151,10 @@ def format_duration_seconds(seconds) -> str:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
 
+class JobCancelled(Exception):
+    """Wird an kooperativen Abbruchpunkten geworfen, wenn ein Job abgebrochen wird."""
+
+
 class BotState:
     def __init__(self):
         self.upload_lock = asyncio.Lock()
@@ -167,9 +171,104 @@ class BotState:
         self.n8n_last_trigger: dict[str, float] = {}
         self.job_running: set[str] = set()
         self.job_events: dict[str, asyncio.Event] = {}
+        self.job_tasks: dict[str, asyncio.Task] = {}
+        self.job_active: set[str] = set()
+        self.job_cancel_requested: dict[str, float] = {}
+        self.job_cancel_timers: dict[str, asyncio.Task] = {}
+        self.cancelled_jobs: dict[str, float] = {}
         self.shutting_down: bool = False
 
 state = BotState()
+
+CANCEL_FORCE_AFTER = float(os.getenv('JOB_CANCEL_FORCE_AFTER_SECONDS', '30'))
+CANCELLED_MARKER_TTL = 3600.0
+
+
+def is_cancel_requested(key: str) -> bool:
+    return key in state.job_cancel_requested
+
+
+def is_cancel_requested(key: str) -> bool:
+    return key in state.job_cancel_requested
+
+
+def raise_if_cancelled(key: str) -> None:
+    if key in state.job_cancel_requested:
+        raise JobCancelled("Job wurde manuell abgebrochen.")
+
+
+def remember_cancelled(key: str) -> None:
+    now = time.time()
+    for old_key, ts in list(state.cancelled_jobs.items()):
+        if now - ts > CANCELLED_MARKER_TTL:
+            del state.cancelled_jobs[old_key]
+    for old_key, ts in list(state.job_cancel_requested.items()):
+        if now - ts > CANCELLED_MARKER_TTL:
+            del state.job_cancel_requested[old_key]
+    state.cancelled_jobs[key] = now
+
+
+async def _force_cancel_later(key: str) -> None:
+    """Safety-Net: bricht auch blockierte Await-Punkte nach einer Gnadenfrist ab."""
+    try:
+        await asyncio.sleep(CANCEL_FORCE_AFTER)
+        task = state.job_tasks.get(key)
+        if task is not None and not task.done() and key in state.job_active:
+            logger.warning(
+                f"[{key}] Kooperativer Abbruch hat nach {CANCEL_FORCE_AFTER:.0f}s nicht gegriffen, "
+                "breche Task hart ab."
+            )
+            task.cancel()
+    except asyncio.CancelledError:
+        pass
+
+
+def request_job_cancel(key: str) -> str:
+    """Fordert den Abbruch eines laufenden oder wartenden Jobs an.
+
+    Wartende Jobs werden direkt gecancelt (sie halten noch keine Ressourcen),
+    laufende Jobs kooperativ ueber Checkpoints plus Gnadenfrist.
+    """
+    if is_cancel_requested(key):
+        return "already_requested"
+
+    task = state.job_tasks.get(key)
+    if task is None:
+        record = JOB_STORE.get(key)
+        if record is not None:
+            JOB_STORE.complete(key, remember=False)
+            remember_cancelled(key)
+            return "cancelled"
+        return "not_found"
+
+    state.job_cancel_requested[key] = time.time()
+    if state.active_job and state.active_job.get("key") == key:
+        state.active_job["stage_label"] = "Abbruch angefordert…"
+        state.active_job["stage"] = "cancelling"
+
+    if key in state.job_active:
+        logger.info(f"[{key}] Abbruch angefordert (Job laeuft).")
+        timer = asyncio.create_task(_force_cancel_later(key))
+        state.job_cancel_timers[key] = timer
+    else:
+        logger.info(f"[{key}] Abbruch angefordert (Job wartet in der Queue).")
+        task.cancel()
+    return "cancelling"
+
+
+def resolve_job_key(key: str | None, job_id: str | None) -> str | None:
+    if key:
+        return key
+    if not job_id:
+        return None
+    for candidate in list(state.job_tasks):
+        record = JOB_STORE.get(candidate)
+        if record and str(record.get("job_id")) == str(job_id):
+            return candidate
+    for record in JOB_STORE.pending():
+        if str(record.get("job_id")) == str(job_id):
+            return record.get("key")
+    return None
 
 class MemoryLogHandler(logging.Handler):
     def __init__(self, buffer: collections.deque):
@@ -197,6 +296,7 @@ async def download_file(
     progress_callback=None,
     inactivity_timeout: int = DOWNLOAD_INACTIVITY_TIMEOUT,
     chunk_size: int = DOWNLOAD_CHUNK_SIZE,
+    cancel_check=None,
 ):
     chunk_size = max(64 * 1024, int(chunk_size))
     logger.info(
@@ -222,6 +322,8 @@ async def download_file(
                 last_logged_mb = 0
                 with open(output_path, 'wb') as f:
                     while True:
+                        if cancel_check:
+                            cancel_check()
                         try:
                             chunk = await asyncio.wait_for(response.content.read(chunk_size), timeout=float(inactivity_timeout))
                         except (asyncio.TimeoutError, TimeoutError):
@@ -303,7 +405,8 @@ async def run_ffmpeg_segment(
     file_path: str,
     output_pattern: str,
     segment_time: float,
-    job_id: str
+    job_id: str,
+    cancel_check=None,
 ) -> list[str]:
     cmd = [
         "ffmpeg",
@@ -323,7 +426,24 @@ async def run_ffmpeg_segment(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
-    stdout, stderr = await proc.communicate()
+    stdout_task = asyncio.create_task(proc.stdout.read())
+    stderr_task = asyncio.create_task(proc.stderr.read())
+    try:
+        while proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if cancel_check:
+                    cancel_check()
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        await proc.wait()
+        raise
+
+    stdout = await stdout_task
+    stderr = await stderr_task
     if proc.returncode != 0:
         err_msg = stderr.decode('utf-8', errors='ignore')
         logger.error(f"[{job_id}] ffmpeg-Fehler: {err_msg}")
@@ -337,7 +457,8 @@ async def split_video_to_parts(
     input_file: str,
     job_dir: str,
     job_id: str,
-    initial_duration: float | None = None
+    initial_duration: float | None = None,
+    cancel_check=None,
 ) -> list[str]:
     """
     Teilt ein Video deterministisch und robust so auf, dass JEDER resultierende Teil
@@ -355,6 +476,8 @@ async def split_video_to_parts(
     max_total_steps = 40
 
     while queue and split_step < max_total_steps:
+        if cancel_check:
+            cancel_check()
         current_file = queue.pop(0)
 
         if not os.path.exists(current_file):
@@ -394,7 +517,7 @@ async def split_video_to_parts(
 
         while attempt < 4:
             attempt += 1
-            new_parts = await run_ffmpeg_segment(current_file, output_pattern, current_seg_time, job_id)
+            new_parts = await run_ffmpeg_segment(current_file, output_pattern, current_seg_time, job_id, cancel_check=cancel_check)
 
             if len(new_parts) > 1:
                 break
@@ -451,6 +574,13 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
     if key in state.job_running:
         return {"status": "duplicate", "key": key, "message": "Job laeuft bereits."}, 202
 
+    task = asyncio.current_task()
+    if task is not None:
+        state.job_tasks[key] = task
+    # Marker eines frueheren Abbruchs entfernen, damit ein erneuter Upload startet.
+    state.job_cancel_requested.pop(key, None)
+    state.cancelled_jobs.pop(key, None)
+
     recording_id = str(data.get("recording_id", ""))
     job_id = recording_id or str(uuid.uuid4())[:8]
 
@@ -476,6 +606,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
     source_url = data.get("source_url")
 
     job_info = {
+        "key": key,
         "job_id": job_id,
         "streamer": streamer,
         "title": title,
@@ -495,6 +626,57 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
     actual_size_mb = 0
     uploaded_message_ids = list(record.get("uploaded_message_ids") or [])
     keep_files = False
+    chat_id = DEFAULT_CHAT_ID
+    topic_title = data.get("topic_name") or streamer or "Allgemein"
+    cancel_check = lambda: raise_if_cancelled(key)
+
+    async def finish_cancelled(reason: str) -> None:
+        """Raeumt einen abgebrochenen Job auf und entfernt bereits gesendete Teile."""
+        timer = state.job_cancel_timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
+        remember_cancelled(key)
+
+        deleted = 0
+        if uploaded_message_ids and state.telegram_client is not None:
+            target_chat = chat_id
+            try:
+                target_chat = int(chat_id)
+            except (TypeError, ValueError):
+                pass
+            try:
+                await state.telegram_client.delete_messages(target_chat, uploaded_message_ids)
+                deleted = len(uploaded_message_ids)
+                logger.info(
+                    f"[{job_id}] {deleted} bereits gesendete Telegram-Teile gelöscht."
+                )
+            except Exception as delete_err:
+                logger.warning(
+                    f"[{job_id}] Konnte gesendete Telegram-Teile nicht löschen: {delete_err}"
+                )
+
+        state.history.appendleft({
+            "job_id": job_id,
+            "streamer": streamer,
+            "title": title,
+            "platform": platform,
+            "source": source,
+            "parts": len(uploaded_message_ids),
+            "total_size_mb": actual_size_mb,
+            "topic_id": None,
+            "topic_name": topic_title,
+            "status": "cancelled",
+            "error": reason,
+            "finished_at": datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+        })
+        if state.active_job and state.active_job.get("key") == key:
+            state.active_job = None
+
+        try:
+            JOB_STORE.complete(key, remember=False)
+        except Exception as store_err:
+            logger.warning(f"[{job_id}] Konnte Job-State nach Abbruch nicht aufräumen: {store_err}")
+        logger.info(f"[{job_id}] Job abgebrochen: {reason}")
 
     try:
         async with state.upload_lock:
@@ -503,6 +685,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
             if job_info in state.waiting_queue:
                 state.waiting_queue.remove(job_info)
 
+            state.job_active.add(key)
             logger.info(f"[{job_id}] Bearbeitung gestartet! (Verbleibend in Queue: {state.waiting_count})")
 
             record = JOB_STORE.mark_running(key)
@@ -542,6 +725,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
             download_label = "Download aus RSS-Feed" if source == "rss" else "Download von Streamrecorder"
 
             state.active_job = {
+                "key": key,
                 "job_id": job_id,
                 "streamer": streamer,
                 "title": title,
@@ -563,8 +747,10 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
             # 1. Thumbnail vorab laden (falls nicht bereits vorhanden)
             if thumbnail_url and not (temp_thumb and os.path.exists(temp_thumb)):
                 try:
-                    await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30)
+                    await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30, cancel_check=cancel_check)
                     logger.info(f"[{job_id}] Thumbnail erfolgreich geladen.")
+                except JobCancelled:
+                    raise
                 except Exception as e:
                     logger.warning(f"[{job_id}] Thumbnail konnte nicht geladen werden, fahre ohne fort: {e}")
                     temp_thumb = None
@@ -574,6 +760,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                 last_dl_report_time = 0.0
                 def dl_progress(done, total):
                     nonlocal last_dl_report_time
+                    raise_if_cancelled(key)
                     now = time.time()
                     if now - last_dl_report_time < 0.5 and done < total:
                         return
@@ -596,7 +783,9 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         )
                         logger.info(f"[{job_id}] yt-dlp-Download abgeschlossen: {os.path.basename(temp_video)}")
                     else:
-                        await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT)
+                        await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT, cancel_check=cancel_check)
+                except JobCancelled:
+                    raise
                 except LiveStream as live_err:
                     logger.info(f"[{job_id}] {live_err}. Item bleibt für einen späteren Versuch vorgemerkt.")
                     if state.active_job and state.active_job.get("job_id") == job_id:
@@ -673,7 +862,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                 if not duration_sec:
                     duration_sec = parse_duration_to_seconds(duration)
 
-                split_parts = await split_video_to_parts(temp_video, job_dir, job_id, initial_duration=duration_sec)
+                split_parts = await split_video_to_parts(temp_video, job_dir, job_id, initial_duration=duration_sec, cancel_check=cancel_check)
                 total_parts = len(split_parts)
                 logger.info(f"[{job_id}] Finale Anzahl geprüfter Video-Teile: {total_parts}")
 
@@ -746,6 +935,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
             uploaded_message_ids = []
             total_upload_files = len(upload_files)
             for part_idx, part in enumerate(upload_files, start=1):
+                raise_if_cancelled(key)
                 if part.get("message_id"):
                     uploaded_message_ids.append(part["message_id"])
                     logger.info(
@@ -777,6 +967,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                     nonlocal last_reported_pct, last_calc_time, last_calc_bytes, last_ui_update_time
                     def callback(current, total):
                         nonlocal last_reported_pct, last_calc_time, last_calc_bytes, last_ui_update_time
+                        raise_if_cancelled(key)
                         pct = int(current / total * 100) if total else 0
                         now = time.time()
                         time_diff = now - last_calc_time
@@ -836,6 +1027,8 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         parse_mode='html',
                         supports_streaming=True
                     )
+                except JobCancelled:
+                    raise
                 except Exception as upload_err:
                     logger.warning(f"[{job_id}] Paralleler Upload fehlgeschlagen ({upload_err}), starte sequentiellen Standard-Upload...", exc_info=True)
                     msg = await state.telegram_client.send_file(
@@ -854,6 +1047,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                 logger.info(f"[{job_id}] Upload erfolgreich! Message ID: {msg.id}")
 
             # 4b. Weiterleiten in Forum-Supergruppe und Topic-Sortierung (falls konfiguriert)
+            raise_if_cancelled(key)
             forum_message_ids = list(record.get("forum_message_ids") or [])
             target_topic_id = record.get("topic_id")
             if forum_chat_id and uploaded_message_ids and not forum_message_ids:
@@ -931,6 +1125,27 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                 "forwarded_message_ids": forum_message_ids
             }, 200
 
+    except JobCancelled as cancel_err:
+        await finish_cancelled(str(cancel_err))
+        return {
+            "status": "cancelled",
+            "job_id": job_id,
+            "key": key,
+            "message": "Job wurde abgebrochen."
+        }, 200
+
+    except asyncio.CancelledError:
+        # Wartende Jobs werden hart gecancelt; laufende Jobs nur als Safety-Net.
+        if key in state.job_cancel_requested:
+            await finish_cancelled("Job wurde manuell abgebrochen.")
+            return {
+                "status": "cancelled",
+                "job_id": job_id,
+                "key": key,
+                "message": "Job wurde abgebrochen."
+            }, 200
+        raise
+
     except Exception as e:
         keep_files = True
         try:
@@ -962,7 +1177,12 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
         if 'job_info' in locals() and job_info in state.waiting_queue:
             state.waiting_queue.remove(job_info)
 
+        state.job_active.discard(key)
         state.job_running.discard(key)
+        state.job_tasks.pop(key, None)
+        timer = state.job_cancel_timers.pop(key, None)
+        if timer is not None:
+            timer.cancel()
         pending_event = state.job_events.pop(key, None)
         if pending_event is not None:
             pending_event.set()
@@ -1012,7 +1232,7 @@ async def archive_rss_item(item: RssItem) -> dict:
         "forum_chat_id": RSS_ARCHIVE_FORUM_CHAT_ID or DEFAULT_FORUM_CHAT_ID,
         "topic_name": item.channel if RSS_TOPIC_PER_FEED else None,
     }
-    payload, status = await process_job(job_data)
+    payload, status = await asyncio.create_task(process_job(job_data))
 
     if status == 202 and payload.get("status") == "duplicate":
         key = payload.get("key") or JOB_STORE.key_for(job_data)
@@ -1020,6 +1240,8 @@ async def archive_rss_item(item: RssItem) -> dict:
         if event is not None:
             logger.info(f"[{key}] Job laeuft bereits, warte auf Abschluss (Wiederaufnahme).")
             await event.wait()
+        if key in state.cancelled_jobs:
+            return {"status": "cancelled", "key": key}
         record = JOB_STORE.get(key)
         if record is not None and record.get("status") == "failed":
             raise RuntimeError(record.get("error") or "Job fehlgeschlagen")
@@ -1137,6 +1359,36 @@ async def handle_n8n_run(request):
         {"status": "started", "workflows": results},
         status=202,
     )
+
+
+async def handle_job_cancel(request):
+    """Bricht einen wartenden oder laufenden Job ab (Dashboard-Session noetig)."""
+    if not get_authed_session(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    key = resolve_job_key(
+        str(data.get("key") or "").strip() or None,
+        str(data.get("job_id") or "").strip() or None,
+    )
+    if not key:
+        return web.json_response(
+            {"error": "Job nicht gefunden", "status": "not_found"},
+            status=404,
+        )
+
+    result = request_job_cancel(key)
+    if result == "not_found":
+        return web.json_response(
+            {"error": "Job nicht gefunden", "status": "not_found", "key": key},
+            status=404,
+        )
+
+    return web.json_response({"status": result, "key": key}, status=202)
 
 
 async def handle_health(request):
@@ -1603,8 +1855,12 @@ async def resume_pending_jobs():
             break
         payload = record.get("payload") or {}
         key = record.get("key")
+        if key in state.cancelled_jobs:
+            logger.info(f"[{key}] Ueberspringe abgebrochenen Job bei der Wiederaufnahme.")
+            continue
         try:
-            await process_job(payload, job_key=key)
+            # Eigener Task, damit ein Abbruch nicht den Resume-Lauf beendet.
+            await asyncio.create_task(process_job(payload, job_key=key))
         except Exception as exc:
             logger.error(f"[{key}] Wiederaufnahme fehlgeschlagen: {exc}", exc_info=True)
 
@@ -1748,6 +2004,7 @@ def create_app():
     app.router.add_post('/voduploader/api/logout', handle_logout)
     app.router.add_get('/voduploader/api/status', handle_dashboard_status)
     app.router.add_get('/voduploader/api/events', handle_dashboard_events)
+    app.router.add_post('/voduploader/api/jobs/cancel', handle_job_cancel)
     app.router.add_static('/voduploader/static/', path=str(STATIC_DIR))
 
     # Topic-Verwaltung

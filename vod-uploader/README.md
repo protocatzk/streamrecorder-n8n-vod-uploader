@@ -16,6 +16,7 @@ Telegram-Archiv fuer Streamrecorder-VODs (per n8n) und fuer rss.app-Feeds.
 | `POST` | `/rss/backfill?limit=10` | Einmalig die neuesten N bestehenden Videos nacharchivieren |
 | `GET` | `/rss/status` | RSS-Feeds, Zaehler, letzter Lauf, Fehler |
 | `POST` | `/n8n/run?name=<key>` | n8n-Workflow per Webhook starten (Dashboard-Session noetig) |
+| `POST` | `/voduploader/api/jobs/cancel` | Wartenden/laufenden Job abbrechen (`{"key": "..."}`, Dashboard-Session noetig) |
 | `GET` | `/voduploader` | Dashboard |
 | `GET` | `/voduploader/topics` | Topic-Verwaltung (Tabelle) |
 
@@ -229,6 +230,33 @@ Telegram-Teile werden anhand ihrer Message-ID uebersprungen; ein Neustart kostet
 hoechstens den gerade laufenden Teil. Doppelte `/upload`-Requests (z. B. ein
 n8n-Retry nach einem Neustart) liefern `202 duplicate` statt eines zweiten
 Uploads. Verwaiste Job-Verzeichnisse werden nach `JOB_STALE_DAYS` entfernt.
+
+## Jobs abbrechen
+
+Im Dashboard laesst sich jeder wartende oder laufende Job abbrechen (Button am
+aktiven Job bzw. `✕` in der Warteschlange). Der Endpunkt
+`POST /voduploader/api/jobs/cancel` erwartet `{"key": "..."}` oder
+`{"job_id": "..."}`.
+
+- Wartende Jobs werden sofort aus der Queue entfernt, ohne den laufenden Job zu
+  beeinflussen.
+- Laufende Jobs brechen an kooperativen Checkpoints ab (Download-Chunks,
+  yt-dlp-Fortschritt, ffmpeg-Split, Upload-Chunks). Greift das nicht, wird der
+  Task nach `JOB_CANCEL_FORCE_AFTER_SECONDS` (Standard `30`) hart beendet.
+- Bereits nach Telegram gesendete Teile werden wieder geloescht.
+- Der Job wird **nicht** als abgeschlossen gespeichert und nach einem Neustart
+  nicht fortgesetzt. Ein abgebrochenes RSS-Item wird dauerhaft uebersprungen.
+- n8n erhaelt `{"status": "cancelled"}` statt eines Timeouts.
+
+## Projektstruktur
+
+- `templates/` – `login.html`, `dashboard.html`, `topics.html`
+- `static/` – zugehoerige CSS/JS-Dateien (`common.js` fuer geteilte Helfer),
+  ausgeliefert unter `/voduploader/static/`
+- `template_loader.py` – laedt und cached die Templates beim Start
+
+Beim Aendern von HTML/CSS/JS ist ein Rebuild noetig, damit die Dateien im Image
+landen.
 
 ## Fehlersuche
 

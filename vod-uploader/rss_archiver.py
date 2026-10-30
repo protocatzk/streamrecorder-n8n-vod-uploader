@@ -1259,6 +1259,8 @@ class RssArchiver:
                     "status": "archived",
                     "reason": "",
                 })
+            elif status == "cancelled":
+                self._mark_skipped(item, summary, "manuell abgebrochen")
             elif status == "live":
                 message = result.get("message") or "Live-Stream läuft noch"
                 self._mark_live(item, summary, str(message))
