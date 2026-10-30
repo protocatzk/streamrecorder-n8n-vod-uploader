@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripper VOD | Live-Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/voduploader/static/dashboard.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10.5 6l-5-3v6l5-3z"/></svg>
+        </div>
+        <div>
+          <div class="brand-title">Ripper VOD Uploader</div>
+          <div class="brand-subtitle">Automatisches Telegram Topic-Archiv</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="user-pill">
+          <div class="dot"></div>
+          <span id="userName">Autorisiert</span>
+        </div>
+        <a class="btn-nav" href="/voduploader/topics">Topics verwalten</a>
+        <button class="btn-logout" onclick="logout()">Abmelden</button>
+      </div>
+    </header>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Bot Status</div>
+        <div class="stat-value" id="botStatus" style="color: var(--emerald);">Online</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Warteschlange</div>
+        <div class="stat-value" id="queueCount">0 Jobs</div>
+      </div>
+      <a class="stat-card" href="/voduploader/topics" style="text-decoration: none; color: inherit;">
+        <div class="stat-label">Topics gemappt</div>
+        <div class="stat-value" id="topicCount">-</div>
+      </a>
+      <div class="stat-card">
+        <div class="stat-label">Ziel-Forum</div>
+        <div class="stat-value" style="font-size: 1.15rem; color: #a5b4fc;">Ripper Archiv</div>
+      </div>
+    </div>
+
+    <!-- RSS Archive -->
+    <div class="card" style="margin-bottom: 2rem;">
+      <div class="card-header">
+        <div class="card-title">
+          <span>RSS-Archiv (rss.app)</span>
+        </div>
+        <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+          <span class="badge badge-idle" id="rssBadge">–</span>
+          <button class="btn-logout" id="rssBackfillBtn" onclick="triggerRssBackfill()">10 nachholen</button>
+          <button class="btn-logout" id="rssBtn" onclick="triggerRss()">Jetzt prüfen</button>
+        </div>
+      </div>
+      <div class="rss-grid">
+        <div>
+          <div class="stat-label">Feeds</div>
+          <div class="stat-value" id="rssFeeds">-</div>
+        </div>
+        <div>
+          <div class="stat-label">Archiviert</div>
+          <div class="stat-value" id="rssArchived" style="color: var(--emerald);">0</div>
+        </div>
+        <div>
+          <div class="stat-label">Übersprungen</div>
+          <div class="stat-value" id="rssSkipped">0</div>
+        </div>
+        <div>
+          <div class="stat-label" title="Retry, Live-Warteschlange und endgültige Fehler">Wartet / Fehler</div>
+          <div class="stat-value" id="rssFailed" style="color: var(--rose);">0</div>
+        </div>
+        <div>
+          <div class="stat-label">Letzter Lauf</div>
+          <div class="stat-value" id="rssLastRun" style="font-size: 1rem;">-</div>
+        </div>
+      </div>
+      <div id="rssFeedList"></div>
+    </div>
+
+    <!-- n8n Workflows -->
+    <div class="card" id="n8nCard" style="margin-bottom: 2rem; display: none;">
+      <div class="card-header">
+        <div class="card-title">
+          <span>n8n-Workflows</span>
+        </div>
+        <div id="n8nButtons" style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;"></div>
+      </div>
+      <div style="font-size: 0.8rem; color: var(--text-muted);">
+        Startet den Streamrecorder-Workflow des jeweiligen Accounts sofort – zusätzlich zum 15-Minuten-Intervall.
+      </div>
+    </div>
+
+    <!-- Active + Queue Grid -->
+    <div class="dash-grid">
+      <!-- Active Job Card -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <span>Aktiver Upload</span>
+          </div>
+          <span class="badge" id="activeBadge">IDLE</span>
+        </div>
+
+        <div id="activeJobContainer">
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+            <div>Aktuell kein aktiver Upload in Bearbeitung.</div>
+            <div style="font-size: 0.8rem; margin-top: 0.25rem;">Der Bot wartet auf neue Requests von n8n.</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Queue Card -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <span>Warteschlange</span>
+          </div>
+          <span class="badge badge-idle" id="queueBadge">0 wartend</span>
+        </div>
+        <div class="queue-list" id="queueList">
+          <div class="empty-state" style="padding: 1.5rem;">
+            Keine wartenden VODs.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- History Card -->
+    <div class="card history-card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Kürzlich archivierte VODs</span>
+        </div>
+        <span style="font-size: 0.82rem; color: var(--text-muted);" id="historyCount">0 abgeschlossen</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Zeitstempel</th>
+              <th>Streamer</th>
+              <th>Titel</th>
+              <th>Dateien / Größe</th>
+              <th>Ziel-Topic</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody">
+            <tr>
+              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 2rem;">Noch keine VODs in dieser Session hochgeladen.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Live Logs -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>Live-Log-Konsole</span>
+        </div>
+        <span style="font-size: 0.8rem; color: var(--text-muted);">Echtzeit-Meldungen</span>
+      </div>
+      <div class="logs-console" id="logsConsole">
+        <div style="color: #64748b;">Verbinde mit Live-Log Stream...</div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/voduploader/static/common.js"></script>
+  <script src="/voduploader/static/dashboard.js"></script>
+</body>
+</html>

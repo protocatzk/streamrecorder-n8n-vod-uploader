@@ -15,7 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py fast_uploader.py topic_manager.py dashboard_templates.py rss_archiver.py job_store.py ./
+COPY main.py fast_uploader.py topic_manager.py template_loader.py rss_archiver.py job_store.py ./
+COPY templates ./templates
+COPY static ./static
 
 EXPOSE 8080
 

@@ -4,3 +4,6 @@
 *.session
 *.session-journal
 __pycache__/
+
+# Lokaler Default-STATE_DIR bei direktem Start ohne Docker
+state/

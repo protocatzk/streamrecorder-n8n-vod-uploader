@@ -20,7 +20,7 @@ from dotenv import load_dotenv, find_dotenv
 from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_to_seconds
 from topic_manager import topic_manager
 from rss_archiver import RssArchiver, RssItem, LiveStream, is_live_error
-from dashboard_templates import LOGIN_HTML, DASHBOARD_HTML, TOPICS_HTML
+from template_loader import LOGIN_HTML, DASHBOARD_HTML, TOPICS_HTML, STATIC_DIR
 from job_store import JobStore
 
 # 1. Lade .env Datei falls vorhanden
@@ -1748,6 +1748,7 @@ def create_app():
     app.router.add_post('/voduploader/api/logout', handle_logout)
     app.router.add_get('/voduploader/api/status', handle_dashboard_status)
     app.router.add_get('/voduploader/api/events', handle_dashboard_events)
+    app.router.add_static('/voduploader/static/', path=str(STATIC_DIR))
 
     # Topic-Verwaltung
     app.router.add_get('/voduploader/topics', handle_topics_page)

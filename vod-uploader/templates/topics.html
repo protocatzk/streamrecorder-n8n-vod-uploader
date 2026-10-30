@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripper VOD | Topic-Verwaltung</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/voduploader/static/topics.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="brand-logo">
+          <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10.5 6l-5-3v6l5-3z"/></svg>
+        </div>
+        <div>
+          <div class="brand-title">Topic-Verwaltung</div>
+          <div class="brand-subtitle">Aliase und Telegram-Topic-IDs verwalten</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="user-pill">
+          <div class="dot"></div>
+          <span id="userName">Autorisiert</span>
+        </div>
+        <a class="btn-nav" href="/voduploader">← Dashboard</a>
+        <button class="btn-logout" onclick="logout()">Abmelden</button>
+      </div>
+    </header>
+
+    <h1 class="page-title">Topics</h1>
+    <p class="page-desc">
+      Hier wird festgelegt, in welches Telegram-Forum-Topic ein Streamer bzw. Kanal einsortiert wird.
+      Der Name ist ein Alias für die Topic-ID. Änderungen werden sofort in <code>topics_cache.json</code> gespeichert.
+    </p>
+
+    <!-- Add topic -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Topic hinzufügen</div>
+        <div class="muted" id="chatInfo"></div>
+      </div>
+      <form id="addForm">
+        <div class="add-grid">
+          <div class="field">
+            <label for="newName">Name / Alias</label>
+            <input type="text" id="newName" maxlength="128" placeholder="z. B. MontanaBlack" autocomplete="off" required>
+          </div>
+          <div class="field">
+            <label for="newTopicId">Topic-ID</label>
+            <input type="text" id="newTopicId" inputmode="numeric" placeholder="z. B. 1234" autocomplete="off">
+          </div>
+          <label class="check-row" for="newCreate">
+            <input type="checkbox" id="newCreate">
+            Im Telegram-Forum erstellen
+          </label>
+          <button class="btn-primary" type="submit" id="addBtn">Hinzufügen</button>
+        </div>
+        <div class="form-hint">
+          Entweder eine bestehende Topic-ID eintragen oder „Im Telegram-Forum erstellen“ aktivieren,
+          damit der Bot ein neues Forum-Topic anlegt.
+        </div>
+      </form>
+    </div>
+
+    <!-- Topic table -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Gemappte Topics</div>
+        <div class="table-tools">
+          <div class="field" id="chatSelectWrap" hidden>
+            <select id="chatSelect" onchange="onChatChange()"></select>
+          </div>
+          <div class="search-box">
+            <input type="text" id="searchInput" placeholder="Suchen…" autocomplete="off" oninput="renderTopics()">
+          </div>
+          <button class="btn-ghost" type="button" onclick="loadTopics()">Aktualisieren</button>
+        </div>
+      </div>
+      <div class="summary" id="summary">Lade Topics…</div>
+      <div class="table-wrap" id="tableWrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Topic</th>
+              <th>Topic-ID</th>
+              <th>Aliase</th>
+              <th style="text-align: right;">Aktionen</th>
+            </tr>
+          </thead>
+          <tbody id="topicsBody"></tbody>
+        </table>
+      </div>
+      <div class="empty-state" id="emptyState" hidden>
+        <strong>Keine Topics gefunden</strong>
+        <span id="emptyHint">Füge oben ein Topic hinzu.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Edit modal -->
+  <div class="modal-backdrop" id="editModal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="editTitle">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="editTitle">Topic bearbeiten</div>
+          <div class="modal-sub" id="editSub"></div>
+        </div>
+        <button class="btn-ghost" type="button" onclick="closeEdit()">✕</button>
+      </div>
+
+      <div class="modal-section">
+        <label for="editTopicId">Topic-ID</label>
+        <input type="text" id="editTopicId" inputmode="numeric">
+        <div class="form-hint">Die neue ID gilt für alle Aliase dieser Gruppe.</div>
+      </div>
+
+      <div class="modal-section">
+        <label>Aliase</label>
+        <div class="alias-list" id="editAliasList"></div>
+        <div class="inline-form">
+          <input type="text" id="aliasName" maxlength="128" placeholder="Neuer Alias…" autocomplete="off">
+          <button class="btn-ghost" type="button" onclick="addAlias()">Hinzufügen</button>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn-ghost" type="button" onclick="closeEdit()">Abbrechen</button>
+        <button class="btn-primary" type="button" id="saveEditBtn" onclick="saveEdit()">Speichern</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="/voduploader/static/common.js"></script>
+  <script src="/voduploader/static/topics.js"></script>
+</body>
+</html>

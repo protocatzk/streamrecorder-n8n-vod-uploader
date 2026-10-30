@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ripper VOD | Login</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/voduploader/static/login.css">
+</head>
+<body>
+  <div class="login-card">
+    <div class="brand-icon">
+      <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10.5 6l-5-3v6l5-3z"/></svg>
+    </div>
+    <h1>VOD Uploader Dashboard</h1>
+    <p class="desc">Klicke auf den Button, um die Anmeldung direkt in Telegram freizugeben.</p>
+
+    <a id="tgLink" href="#" target="_blank" class="btn-tg">
+      <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.75-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .37z"/></svg>
+      Mit Telegram bestätigen
+    </a>
+
+    <div class="status-box" id="statusBox">
+      <div class="spinner" id="spinner"></div>
+      <span id="statusText">Initialisiere Login-Token...</span>
+    </div>
+
+    <div class="info-footer">
+      Nur autorisierte Konten (@Ripperchieff, @x42067) haben Zugriff.
+    </div>
+  </div>
+
+  <script src="/voduploader/static/login.js"></script>
+</body>
+</html>
