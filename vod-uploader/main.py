@@ -19,7 +19,15 @@ from telethon.tl.types import DocumentAttributeVideo, DocumentAttributeFilename
 from dotenv import load_dotenv, find_dotenv
 from fast_uploader import fast_upload_file, get_video_metadata, parse_duration_to_seconds
 from topic_manager import topic_manager
-from rss_archiver import RssArchiver, RssItem, LiveStream, is_live_error
+from rss_archiver import (
+    RssArchiver,
+    RssItem,
+    LiveStream,
+    is_bot_check_error,
+    is_live_error,
+    is_members_only_error,
+    is_permanent_error,
+)
 from template_loader import LOGIN_HTML, DASHBOARD_HTML, TOPICS_HTML, STATIC_DIR
 from job_store import JobStore
 
@@ -81,7 +89,13 @@ RSS_MAX_RETRIES = int(os.getenv('RSS_MAX_RETRIES', '0'))
 RSS_RETRY_BASE_SECONDS = int(os.getenv('RSS_RETRY_BASE_SECONDS', '900'))
 RSS_RETRY_MAX_DELAY_SECONDS = int(os.getenv('RSS_RETRY_MAX_DELAY_SECONDS', '21600'))
 RSS_LIVE_RECHECK_SECONDS = int(os.getenv('RSS_LIVE_RECHECK_SECONDS', '900'))
+RSS_BOT_PAUSE_SECONDS = int(os.getenv('RSS_BOT_PAUSE_SECONDS', '3600'))
+RSS_LIVE_MAX_AGE_DAYS = int(os.getenv('RSS_LIVE_MAX_AGE_DAYS', '7'))
+RSS_RETRY_MAX_AGE_DAYS = int(os.getenv('RSS_RETRY_MAX_AGE_DAYS', '30'))
+RSS_MAX_RETRIES_PER_POLL = int(os.getenv('RSS_MAX_RETRIES_PER_POLL', '3'))
 YTDLP_COOKIES_FILE = os.getenv('YTDLP_COOKIES_FILE') or None
+YTDLP_POT_PROVIDER_URL = os.getenv('YTDLP_POT_PROVIDER_URL', 'http://bgutil-provider:4416').strip() or None
+YTDLP_PROXY = os.getenv('YTDLP_PROXY', '').strip() or None
 YTDLP_CONCURRENT_FRAGMENTS = int(os.getenv('YTDLP_CONCURRENT_FRAGMENTS', '4'))
 YTDLP_RETRIES = int(os.getenv('YTDLP_RETRIES', '10'))
 YTDLP_HTTP_CHUNK_SIZE = int(os.getenv('YTDLP_HTTP_CHUNK_SIZE', str(10 * 1024 * 1024)))
@@ -111,6 +125,7 @@ JOB_STORE = JobStore(
     STATE_DIR,
     done_ttl_days=int(os.getenv('JOB_DONE_TTL_DAYS', '14')),
     stale_days=int(os.getenv('JOB_STALE_DAYS', '3')),
+    failed_ttl_days=int(os.getenv('JOB_FAILED_TTL_DAYS', '30')),
 )
 
 logger.info(f"Konfiguration geladen (API_ID: {API_ID}, Default Chat: {DEFAULT_CHAT_ID}, Forum Chat: {DEFAULT_FORUM_CHAT_ID}, Drop Author: {FORWARD_DROP_AUTHOR}, Split-Schwelle: 1.8 GB, Zielgröße: 1.4 GB, Parallele Upload-Worker: {PARALLEL_WORKERS}, FFmpeg-Threads: {FFMPEG_THREADS}, Erlaubte Dashboard-User: {ALLOWED_DASHBOARD_USERS}, Inaktivitäts-Timeout: {DOWNLOAD_INACTIVITY_TIMEOUT}s)")
@@ -297,11 +312,19 @@ async def download_file(
     inactivity_timeout: int = DOWNLOAD_INACTIVITY_TIMEOUT,
     chunk_size: int = DOWNLOAD_CHUNK_SIZE,
     cancel_check=None,
+    resume: bool = True,
 ):
     chunk_size = max(64 * 1024, int(chunk_size))
+    existing = 0
+    if resume and os.path.exists(output_path):
+        try:
+            existing = os.path.getsize(output_path)
+        except OSError:
+            existing = 0
     logger.info(
         f"Starte Download von: {url[:80]}... nach {output_path} "
-        f"(Inaktivitäts-Timeout: {inactivity_timeout}s, Chunk: {chunk_size // 1024} KB)"
+        f"(Inaktivitäts-Timeout: {inactivity_timeout}s, Chunk: {chunk_size // 1024} KB"
+        f"{f', Resume ab {existing} Bytes' if existing else ''})"
     )
     timeout = ClientTimeout(total=None, sock_read=inactivity_timeout, sock_connect=30)
     headers = {
@@ -310,17 +333,64 @@ async def download_file(
         "Accept-Encoding": "identity",
         "Connection": "keep-alive"
     }
+    if existing > 0:
+        headers["Range"] = f"bytes={existing}-"
+
+    def _content_range_total(value: str) -> int:
+        try:
+            return int(str(value).rsplit("/", 1)[1])
+        except (ValueError, IndexError, TypeError):
+            return 0
 
     try:
         async with ClientSession(timeout=timeout, read_bufsize=chunk_size) as session:
             async with session.get(url, headers=headers) as response:
-                if response.status != 200:
+                if response.status == 416 and existing:
+                    total = _content_range_total(response.headers.get("Content-Range", ""))
+                    if total and existing >= total:
+                        logger.info(
+                            f"Download bereits vollständig ({existing} Bytes), kein erneuter Transfer nötig."
+                        )
+                        return
+                    # Ungültiger Range-Zustand: Teildatei verwerfen, damit der
+                    # nächste Versuch sauber bei 0 beginnt.
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                    raise ClientPayloadError(
+                        "Range-Request wurde abgelehnt (HTTP 416), Teildownload verworfen."
+                    )
+
+                if response.status == 206 and existing:
+                    content_range = response.headers.get("Content-Range", "")
+                    match = re.match(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", content_range)
+                    if match and int(match.group(1)) != existing:
+                        try:
+                            os.remove(output_path)
+                        except OSError:
+                            pass
+                        raise ClientPayloadError(
+                            "Range-Antwort passt nicht zum vorhandenen Teildownload, starte neu."
+                        )
+                    total_size = _content_range_total(content_range)
+                    if not total_size:
+                        total_size = existing + int(response.headers.get('Content-Length', 0) or 0)
+                    mode = "ab"
+                    downloaded = existing
+                elif response.status == 200:
+                    if existing:
+                        logger.info(
+                            "Server unterstützt kein Resume, Download startet von vorne."
+                        )
+                    total_size = int(response.headers.get('Content-Length', 0))
+                    mode = "wb"
+                    downloaded = 0
+                else:
                     raise Exception(f"Download fehlgeschlagen mit HTTP {response.status}")
 
-                total_size = int(response.headers.get('Content-Length', 0))
-                downloaded = 0
-                last_logged_mb = 0
-                with open(output_path, 'wb') as f:
+                last_logged_mb = downloaded // (100 * 1024 * 1024)
+                with open(output_path, mode) as f:
                     while True:
                         if cancel_check:
                             cancel_check()
@@ -747,7 +817,7 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
             # 1. Thumbnail vorab laden (falls nicht bereits vorhanden)
             if thumbnail_url and not (temp_thumb and os.path.exists(temp_thumb)):
                 try:
-                    await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30, cancel_check=cancel_check)
+                    await download_file(thumbnail_url, temp_thumb, inactivity_timeout=30, cancel_check=cancel_check, resume=False)
                     logger.info(f"[{job_id}] Thumbnail erfolgreich geladen.")
                 except JobCancelled:
                     raise
@@ -798,7 +868,12 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         "message": str(live_err)
                     }, 200
                 except Exception as dl_err:
-                    if use_ytdlp and is_live_error(dl_err):
+                    if (
+                        use_ytdlp
+                        and is_live_error(dl_err)
+                        and not is_permanent_error(dl_err)
+                        and not is_members_only_error(dl_err)
+                    ):
                         logger.info(f"[{job_id}] Live/Premiere erkannt ({dl_err}). Item bleibt für einen späteren Versuch vorgemerkt.")
                         if state.active_job and state.active_job.get("job_id") == job_id:
                             state.active_job['stage'] = 'waiting'
@@ -809,16 +884,47 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                             "job_id": job_id,
                             "message": str(dl_err)
                         }, 200
-                    logger.warning(f"[{job_id}] Download abgebrochen oder fehlgeschlagen ({dl_err}). Video wird übersprungen.")
+                    is_permanent = is_members_only_error(dl_err) or is_permanent_error(dl_err)
+                    if is_permanent:
+                        logger.warning(
+                            f"[{job_id}] Download endgueltig fehlgeschlagen ({dl_err}). "
+                            "Video wird uebersprungen."
+                        )
+                        if state.active_job and state.active_job.get("job_id") == job_id:
+                            state.active_job['stage'] = 'skipped'
+                            state.active_job['stage_label'] = "Übersprungen (dauerhafter Fehler)"
+                        JOB_STORE.complete(key, status="skipped", remember=False)
+                        return {
+                            "status": "skipped",
+                            "job_id": job_id,
+                            "message": f"Download endgueltig fehlgeschlagen ({dl_err})."
+                        }, 200
+
+                    # Transienter Fehler: Teildownload behalten, damit yt-dlp bzw.
+                    # der Range-Downloader beim naechsten Versuch weiterladen kann.
+                    keep_files = True
+                    try:
+                        JOB_STORE.fail(key, str(dl_err))
+                    except Exception as store_err:
+                        logger.warning(f"[{job_id}] Konnte Job-State nicht speichern: {store_err}")
+                    logger.warning(
+                        f"[{job_id}] Download fehlgeschlagen ({dl_err}). "
+                        "Teildownload bleibt fuer den naechsten Versuch erhalten."
+                    )
                     if state.active_job and state.active_job.get("job_id") == job_id:
-                        state.active_job['stage'] = 'skipped'
-                        is_timeout = isinstance(dl_err, (asyncio.TimeoutError, TimeoutError)) or 'Inaktivitäts-Timeout' in str(dl_err)
-                        state.active_job['stage_label'] = f"Übersprungen ({DOWNLOAD_INACTIVITY_TIMEOUT}s Timeout)" if is_timeout else "Übersprungen (Download fehlgeschlagen)"
-                    JOB_STORE.complete(key, status="skipped", remember=False)
+                        state.active_job['stage'] = 'waiting'
+                        is_timeout = (
+                            isinstance(dl_err, (asyncio.TimeoutError, TimeoutError))
+                            or 'Inaktivitäts-Timeout' in str(dl_err)
+                        )
+                        state.active_job['stage_label'] = (
+                            f"Download-Timeout ({DOWNLOAD_INACTIVITY_TIMEOUT}s), Retry folgt"
+                            if is_timeout else "Download fehlgeschlagen, Retry folgt"
+                        )
                     return {
                         "status": "skipped",
                         "job_id": job_id,
-                        "message": f"Download fehlgeschlagen ({dl_err}), Video übersprungen."
+                        "message": f"Download fehlgeschlagen ({dl_err}), Retry folgt."
                     }, 200
 
                 if not os.path.exists(temp_video):
@@ -1274,6 +1380,12 @@ rss_archiver = RssArchiver(
     ytdlp_retries=YTDLP_RETRIES,
     ytdlp_http_chunk_size=YTDLP_HTTP_CHUNK_SIZE,
     ytdlp_format=YTDLP_FORMAT,
+    pot_provider_url=YTDLP_POT_PROVIDER_URL,
+    proxy=YTDLP_PROXY,
+    bot_pause_seconds=RSS_BOT_PAUSE_SECONDS,
+    live_max_age_days=RSS_LIVE_MAX_AGE_DAYS,
+    retry_max_age_days=RSS_RETRY_MAX_AGE_DAYS,
+    max_retries_per_poll=RSS_MAX_RETRIES_PER_POLL,
 )
 
 
@@ -1304,6 +1416,21 @@ async def handle_rss_backfill(request):
         {"status": "started" if started else "busy", "limit": limit},
         status=202 if started else 409,
     )
+
+
+async def handle_rss_retry_reset(request):
+    """Setzt den Retry-Backoff zurueck (z. B. nach einem Cookie-Wechsel)."""
+    if not get_authed_session(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    if not RSS_ENABLED:
+        return web.json_response({"status": "disabled"}, status=503)
+    reset = rss_archiver.reset_retries()
+    started = rss_archiver.trigger()
+    return web.json_response({
+        "status": "ok",
+        "reset": reset,
+        "poll_started": started,
+    })
 
 
 async def handle_n8n_run(request):
@@ -1876,7 +2003,8 @@ async def on_startup(app):
         rss_archiver.start()
         logger.info(
             "RSS-Archiv aktiviert (OPML: %s, Feed-URLs: %d, Feed-Filter: %s, Intervall: %ss, "
-            "Retries: %s, Retry-Backoff: %ss-%ss, Live-Recheck: %ss, yt-dlp-Fragmente: %d).",
+            "Retries: %s, Retry-Backoff: %ss-%ss, Live-Recheck: %ss, yt-dlp-Fragmente: %d, "
+            "Cookies: %s, PO-Provider: %s).",
             RSS_OPML_FILE or "-",
             len(RSS_FEED_URLS),
             ", ".join(RSS_FEED_TITLES) if RSS_FEED_TITLES else "alle Feeds",
@@ -1886,6 +2014,8 @@ async def on_startup(app):
             RSS_RETRY_MAX_DELAY_SECONDS,
             RSS_LIVE_RECHECK_SECONDS,
             YTDLP_CONCURRENT_FRAGMENTS,
+            YTDLP_COOKIES_FILE or "-",
+            YTDLP_POT_PROVIDER_URL or "-",
         )
     else:
         logger.info("RSS-Archiv ist deaktiviert (RSS_ENABLED=false).")
@@ -1987,10 +2117,12 @@ def create_app():
     app.router.add_post('/rss/check', handle_rss_check)
     app.router.add_get('/rss/status', handle_rss_status)
     app.router.add_post('/rss/backfill', handle_rss_backfill)
+    app.router.add_post('/rss/retry', handle_rss_retry_reset)
     # Alias unter dem Traefik-Prefix, damit das Dashboard den Endpunkt erreicht.
     app.router.add_post('/voduploader/rss/check', handle_rss_check)
     app.router.add_get('/voduploader/rss/status', handle_rss_status)
     app.router.add_post('/voduploader/rss/backfill', handle_rss_backfill)
+    app.router.add_post('/voduploader/api/rss/retry', handle_rss_retry_reset)
 
     # n8n-Workflow-Trigger (Dashboard-Buttons)
     app.router.add_post('/n8n/run', handle_n8n_run)

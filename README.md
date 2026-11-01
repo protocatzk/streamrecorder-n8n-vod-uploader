@@ -114,6 +114,8 @@ Die wichtigsten Variablen:
 | `DOWNLOAD_INACTIVITY_TIMEOUT` | Abbruch bei Inaktivitaet in Sekunden |
 | `RSS_ENABLED` / `RSS_FEED_URLS` | RSS-Archiv und Feeds |
 | `RSS_ARCHIVE_CHAT_ID` / `RSS_ARCHIVE_FORUM_CHAT_ID` | Ziele fuer RSS-Uploads |
+| `YTDLP_COOKIES_FILE` | Netscape-Cookies fuer YouTube/X (Default `/app/ytdlp/cookies.txt`) |
+| `YTDLP_POT_PROVIDER_URL` | PO-Token-Provider (Default `http://bgutil-provider:4416`) |
 | `N8N_WEBHOOKS` | Webhook-URLs fuer die Dashboard-Buttons (`name=url,...`) |
 | `STATE_DIR` | Pfad des Job-Spools (Default `/app/state`) |
 | `JOB_DONE_TTL_DAYS` | Duplikat-Gedaechtnis in Tagen (Default 14) |
@@ -285,6 +287,8 @@ mitgeliefert.
 | `401 Unauthorized` am Dashboard | Session abgelaufen (Neustart) – neu per Telegram einloggen |
 | n8n-Button liefert `Nicht verfuegbar` | `N8N_WEBHOOKS` leer oder Webhook im Workflow nicht aktiv |
 | `202 duplicate` im n8n-Log | Job laeuft bereits oder wurde bereits hochgeladen (gewollt) |
+| `Sign in to confirm you're not a bot` | YouTube blockt die Server-IP. Cookies in `vod-uploader/ytdlp/cookies.txt` erneuern, PO-Provider pruefen, danach **Retries zurücksetzen**. Details in `vod-uploader/README.md`. |
+| RSS-Queue haengt an Dauerfehlern | Retry-Frist (`RSS_RETRY_MAX_AGE_DAYS`), Live-Frist (`RSS_LIVE_MAX_AGE_DAYS`) und Retry-Budget (`RSS_MAX_RETRIES_PER_POLL`) pruefen |
 | Upload haengt nach Neustart | Log auf `Setze gespeicherten Job fort` pruefen; Teile mit Message-ID werden uebersprungen |
 | Queue haengt an einem Job | Im Dashboard abbrechen (Button am aktiven Job); Details siehe `vod-uploader/README.md` |
 | Splitting schlaegt fehl | FFmpeg-Meldung im Log; Job-Verzeichnis in `state_data/jobs/<key>` pruefen |

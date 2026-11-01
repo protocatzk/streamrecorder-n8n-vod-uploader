@@ -190,9 +190,17 @@ function renderRss(rss) {
   if (!rss.enabled) {
     badge.className = 'badge badge-idle';
     badge.innerText = 'AUS';
+  } else if (rss.cookies && rss.cookies.broken) {
+    badge.className = 'badge badge-live';
+    badge.innerText = 'COOKIES UNGÜLTIG';
+    badge.title = rss.cookies.reason || 'Cookie-Datei ersetzen und Retries zurücksetzen';
+  } else if (rss.blocked_until && rss.blocked_until > Date.now() / 1000) {
+    badge.className = 'badge badge-live';
+    badge.innerText = 'YOUTUBE BLOCKIERT';
+    badge.title = 'Bot-Check aktiv – Cookies/PO-Provider prüfen';
   } else if (rss.running) {
     badge.className = 'badge badge-live';
-    badge.innerText = 'LÄUFT';
+    badge.innerText = rss.processing ? 'VERARBEITET' : 'LÄUFT';
   } else if (rss.last_error) {
     badge.className = 'badge badge-idle';
     badge.innerText = 'FEHLER';
@@ -265,6 +273,27 @@ async function triggerRssBackfill() {
     btn.disabled = false;
     btn.innerText = '10 nachholen';
   }, 4000);
+}
+
+async function resetRssRetries() {
+  const btn = document.getElementById('rssRetryBtn');
+  btn.disabled = true;
+  btn.innerText = 'Setze zurück...';
+  let label = 'Retries zurücksetzen';
+  try {
+    const res = await fetch('/voduploader/api/rss/retry', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) label = `${data.reset || 0} zurückgesetzt`;
+    else if (res.status === 401) label = 'Login abgelaufen';
+    else label = 'Fehler';
+  } catch (e) {
+    label = 'Fehler';
+  }
+  btn.innerText = label;
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.innerText = 'Retries zurücksetzen';
+  }, 5000);
 }
 
 const N8N_LABELS = {

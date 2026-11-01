@@ -46,19 +46,21 @@ def make_key(data: Dict[str, Any]) -> str:
 class JobStore:
     """Atomarer JSON-Store fuer Job-Metadaten plus Job-Verzeichnisse."""
 
-    def __init__(self, base_dir: str, done_ttl_days: int = 14, stale_days: int = 3):
+    def __init__(self, base_dir: str, done_ttl_days: int = 14, stale_days: int = 3, failed_ttl_days: int = 30):
         self.base_dir = os.path.abspath(base_dir)
         self.jobs_dir = os.path.join(self.base_dir, "jobs")
         self.jobs_file = os.path.join(self.base_dir, "jobs.json")
         self.done_file = os.path.join(self.base_dir, "done.json")
         self.done_ttl = max(1, done_ttl_days) * 86400
         self.stale_seconds = max(1, stale_days) * 86400
+        self.failed_ttl = max(1, failed_ttl_days) * 86400
 
         os.makedirs(self.jobs_dir, exist_ok=True)
         self._jobs: Dict[str, Dict[str, Any]] = self._read(self.jobs_file, {})
         self._done: Dict[str, float] = self._read(self.done_file, {})
         self._prune_done()
         self._save_done()
+        self._prune_failed()
         self._prune_dirs()
 
     # ------------------------------------------------------------------ io
@@ -179,6 +181,34 @@ class JobStore:
     def _prune_done(self) -> None:
         cutoff = time.time() - self.done_ttl
         self._done = {key: ts for key, ts in self._done.items() if float(ts) >= cutoff}
+
+    @staticmethod
+    def _record_timestamp(record: Dict[str, Any]) -> float:
+        for field in ("updated_at", "created_at"):
+            raw = record.get(field)
+            if not raw:
+                continue
+            try:
+                return datetime.fromisoformat(str(raw)).timestamp()
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def _prune_failed(self) -> None:
+        """Entfernt fehlgeschlagene Jobs (inkl. partialer Downloads) nach TTL."""
+        cutoff = time.time() - self.failed_ttl
+        removed: List[str] = []
+        for key, record in list(self._jobs.items()):
+            if record.get("status") != "failed":
+                continue
+            updated = self._record_timestamp(record)
+            if updated and updated < cutoff:
+                self._jobs.pop(key, None)
+                removed.append(key)
+        if removed:
+            self._save_jobs()
+            for key in removed:
+                self.remove_job_dir(key)
 
     def _prune_dirs(self) -> None:
         referenced = {

@@ -59,6 +59,7 @@
         </div>
         <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
           <span class="badge badge-idle" id="rssBadge">–</span>
+          <button class="btn-logout" id="rssRetryBtn" onclick="resetRssRetries()" title="Retry-Backoff zurücksetzen (z. B. nach Cookie-Wechsel)">Retries zurücksetzen</button>
           <button class="btn-logout" id="rssBackfillBtn" onclick="triggerRssBackfill()">10 nachholen</button>
           <button class="btn-logout" id="rssBtn" onclick="triggerRss()">Jetzt prüfen</button>
         </div>

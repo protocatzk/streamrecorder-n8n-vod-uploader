@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import shutil
+import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -96,8 +98,35 @@ NO_VIDEO_HINTS = (
     "not a video",
 )
 
+# YouTube blockt Server-IPs regelmaessig mit einem Login-/Bot-Check. Das ist
+# transient (Cookies/PO-Token/Proxy), aber ein Retry alle 15 Minuten macht es
+# nur schlimmer -> eigener Fehlertyp mit globaler Pause.
+BOT_CHECK_HINTS = (
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "not a bot",
+    "too many requests",
+    "http error 429",
+)
+
+# Dauerhafte Fehler, bei denen ein Retry nichts bringt.
+MEMBERS_ONLY_HINTS = (
+    "available to this channel's members",
+    "available to this channel’s members",
+    "members-only",
+    "member-only",
+    "join this channel",
+    "channel members",
+)
+
+AGE_RESTRICTED_HINTS = (
+    "confirm your age",
+    "age-restricted",
+    "inappropriate for some users",
+)
+
 # Fehler, bei denen ein erneuter Versuch dauerhaft aussichtslos ist.
-PERMANENT_HINTS = NO_VIDEO_HINTS + (
+PERMANENT_HINTS = NO_VIDEO_HINTS + MEMBERS_ONLY_HINTS + (
     "video unavailable",
     "this video is unavailable",
     "private video",
@@ -110,7 +139,26 @@ PERMANENT_HINTS = NO_VIDEO_HINTS + (
     "blocked it on copyright grounds",
     "not available in your country",
     "not made this video available in your country",
+    # "requested format is not available" ist NICHT dauerhaft: das kann an
+    # einem ungueltigen Cookie-Login oder einem Client-/PO-Token-Problem liegen
+    # und wird mit Cookie-Fallback erneut versucht.
+    # "This live stream recording is not available" ist kein laufender Stream,
+    # sondern ein dauerhaft fehlendes Recording.
+    "live stream recording is not available",
+    "this live stream recording is not available",
+    "http 404",
+    "http 410",
+    "http 451",
+)
+
+# Fehler, bei denen ein zweiter Versuch ohne Cookies sinnvoll ist (kaputte oder
+# abgelaufene Login-Session liefert zwar Metadaten, aber keine Formate).
+# Ein Bot-Check gehoert bewusst NICHT hierher: er ist meist video-/IP-bezogen
+# und bedeutet nicht, dass die Cookie-Datei ungueltig ist.
+COOKIE_FALLBACK_HINTS = (
     "requested format is not available",
+    "the page needs to be reloaded",
+    "login required",
 )
 
 # Hinweise auf Live/Upcoming/Premiere in yt-dlp-Fehlermeldungen.
@@ -136,6 +184,26 @@ def is_no_video_error(exc: Exception) -> bool:
 def is_permanent_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(hint in message for hint in PERMANENT_HINTS)
+
+
+def is_bot_check_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(hint in message for hint in BOT_CHECK_HINTS)
+
+
+def is_members_only_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(hint in message for hint in MEMBERS_ONLY_HINTS)
+
+
+def is_age_restricted_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(hint in message for hint in AGE_RESTRICTED_HINTS)
+
+
+def is_cookie_fallback_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(hint in message for hint in COOKIE_FALLBACK_HINTS)
 
 
 def is_live_error(exc: Exception) -> bool:
@@ -256,6 +324,76 @@ class _YdlLogger:
         logger.error("yt-dlp: %s", msg)
 
 
+# Cookie-Datei kann im Betrieb ausgetauscht werden. Wenn eine Session zwar den
+# Bot-Check umgeht, aber keine Formate liefert, wird sie bis zur naechsten
+# Aenderung der Datei (mtime) uebersprungen.
+_COOKIE_STATE_LOCK = threading.Lock()
+_COOKIE_STATE = {"mtime": None, "broken": False, "reason": ""}
+
+
+def _cookie_mtime(path: str | None) -> float | None:
+    if not path:
+        return None
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _cookies_usable(path: str | None) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    mtime = _cookie_mtime(path)
+    with _COOKIE_STATE_LOCK:
+        if _COOKIE_STATE["mtime"] != mtime:
+            _COOKIE_STATE["mtime"] = mtime
+            _COOKIE_STATE["broken"] = False
+            _COOKIE_STATE["reason"] = ""
+        return not _COOKIE_STATE["broken"]
+
+
+def _mark_cookies_broken(path: str | None, reason: str) -> None:
+    with _COOKIE_STATE_LOCK:
+        _COOKIE_STATE["mtime"] = _cookie_mtime(path)
+        _COOKIE_STATE["broken"] = True
+        _COOKIE_STATE["reason"] = str(reason)[:300]
+
+
+def _cookie_state() -> dict:
+    with _COOKIE_STATE_LOCK:
+        return dict(_COOKIE_STATE)
+
+
+def _reset_cookie_state() -> None:
+    with _COOKIE_STATE_LOCK:
+        _COOKIE_STATE["mtime"] = None
+        _COOKIE_STATE["broken"] = False
+        _COOKIE_STATE["reason"] = ""
+
+
+def _copy_cookie_file(path: str) -> str | None:
+    """Kopiert die Cookie-Datei nach /tmp, damit yt-dlp sie beschreiben kann.
+
+    Die Originaldatei bleibt dadurch unangetastet und kann im laufenden Betrieb
+    ausgetauscht werden. yt-dlp schreibt rotierte Cookies in die Kopie.
+    """
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
+        with os.fdopen(fd, "wb") as dst, open(path, "rb") as src:
+            shutil.copyfileobj(src, dst)
+        os.chmod(temp_path, 0o600)
+        return temp_path
+    except OSError as exc:
+        logger.warning("Konnte Cookie-Datei nicht kopieren (%s): %s", path, exc)
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return None
+
+
 def _ytdlp_options(
     cookies_file: str | None,
     *,
@@ -263,7 +401,9 @@ def _ytdlp_options(
     concurrent_fragments: int = 4,
     http_chunk_size: int = 10 * 1024 * 1024,
     buffer_size: int = 1024 * 1024,
-) -> dict:
+    pot_provider_url: str | None = None,
+    proxy: str | None = None,
+) -> tuple[dict, str | None]:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -278,9 +418,19 @@ def _ytdlp_options(
         "remote_components": ["ejs:github"],
         "logger": _YdlLogger(),
     }
-    if cookies_file and os.path.exists(cookies_file):
-        opts["cookiefile"] = cookies_file
-    return opts
+    cookie_temp = None
+    if cookies_file and _cookies_usable(cookies_file):
+        cookie_temp = _copy_cookie_file(cookies_file)
+        if cookie_temp:
+            opts["cookiefile"] = cookie_temp
+    if pot_provider_url:
+        # bgutil HTTP-Provider (docker-compose.yml: bgutil-provider)
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": [pot_provider_url]},
+        }
+    if proxy:
+        opts["proxy"] = proxy
+    return opts, cookie_temp
 
 
 def _live_message(info: dict) -> str:
@@ -297,6 +447,8 @@ def _probe_sync(
     retries: int = 10,
     concurrent_fragments: int = 4,
     http_chunk_size: int = 10 * 1024 * 1024,
+    pot_provider_url: str | None = None,
+    proxy: str | None = None,
 ) -> dict:
     """Prueft per yt-dlp, ob die URL ein (archivierbares) Video enthaelt."""
     try:
@@ -304,30 +456,56 @@ def _probe_sync(
     except ImportError as exc:  # pragma: no cover - sollte im Image vorhanden sein
         raise RuntimeError("yt-dlp ist nicht installiert") from exc
 
-    opts = _ytdlp_options(
+    opts, cookie_temp = _ytdlp_options(
         cookies_file,
         retries=retries,
         concurrent_fragments=concurrent_fragments,
         http_chunk_size=http_chunk_size,
+        pot_provider_url=pot_provider_url,
+        proxy=proxy,
     )
-    opts["skip_download"] = True
+    try:
+        opts["skip_download"] = True
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+        def _probe(options):
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(url, download=False)
 
-    if not info:
-        raise NotAVideo("Keine Videoinformationen gefunden")
+        try:
+            info = _probe(opts)
+        except Exception as exc:
+            if opts.get("cookiefile") and is_cookie_fallback_error(exc):
+                logger.warning(
+                    "yt-dlp-Probe mit Cookies fehlgeschlagen (%s). Versuche ohne Cookies "
+                    "(Cookie-Session evtl. abgelaufen).",
+                    exc,
+                )
+                _mark_cookies_broken(cookies_file, str(exc))
+                fallback = dict(opts)
+                fallback.pop("cookiefile", None)
+                info = _probe(fallback)
+            else:
+                raise
 
-    if info.get("_type") == "playlist":
-        entries = [entry for entry in (info.get("entries") or []) if entry]
-        if not entries:
-            raise NotAVideo("Leere Playlist")
-        info = entries[0]
+        if not info:
+            raise NotAVideo("Keine Videoinformationen gefunden")
 
-    if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
-        raise LiveStream(_live_message(info))
+        if info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if entry]
+            if not entries:
+                raise NotAVideo("Leere Playlist")
+            info = entries[0]
 
-    return info
+        if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
+            raise LiveStream(_live_message(info))
+
+        return info
+    finally:
+        if cookie_temp:
+            try:
+                os.remove(cookie_temp)
+            except OSError:
+                pass
 
 
 def _download_sync(
@@ -341,6 +519,8 @@ def _download_sync(
     concurrent_fragments: int = 4,
     http_chunk_size: int = 10 * 1024 * 1024,
     format_selector: str | None = None,
+    pot_provider_url: str | None = None,
+    proxy: str | None = None,
 ) -> tuple[str, dict]:
     try:
         import yt_dlp
@@ -360,61 +540,89 @@ def _download_sync(
 
     live_detected = {"flag": False, "message": "Live-Stream läuft noch"}
 
-    opts = _ytdlp_options(
+    opts, cookie_temp = _ytdlp_options(
         cookies_file,
         retries=retries,
         concurrent_fragments=concurrent_fragments,
         http_chunk_size=http_chunk_size,
+        pot_provider_url=pot_provider_url,
+        proxy=proxy,
     )
-    opts.update({
-        "outtmpl": {"default": out_base + ".%(ext)s"},
-        "format": format_selector or "bestvideo*+bestaudio/best",
-        "merge_output_format": "mp4",
-        "overwrites": True,
-        "continuedl": True,
-        "progress_hooks": [hook],
-    })
-
-    def match_filter(info, *, incomplete=False):
-        if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
-            live_detected["flag"] = True
-            live_detected["message"] = _live_message(info)
-            return "Live-Stream wird nicht archiviert"
-        return None
-
-    opts["match_filter"] = match_filter
-
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as exc:
-        if live_detected["flag"]:
-            raise LiveStream(live_detected["message"]) from exc
-        raise
+        opts.update({
+            "outtmpl": {"default": out_base + ".%(ext)s"},
+            "format": format_selector or "bestvideo*+bestaudio/best",
+            "merge_output_format": "mp4",
+            "overwrites": True,
+            "continuedl": True,
+            "progress_hooks": [hook],
+        })
 
-    if live_detected["flag"] and not info:
-        raise LiveStream(live_detected["message"])
+        def match_filter(info, *, incomplete=False):
+            if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
+                live_detected["flag"] = True
+                live_detected["message"] = _live_message(info)
+                return "Live-Stream wird nicht archiviert"
+            return None
 
-    candidates: list[str] = []
-    for downloaded in (info or {}).get("requested_downloads") or []:
-        path = downloaded.get("filepath")
-        if path and os.path.exists(path):
-            candidates.append(path)
-    if not candidates:
+        opts["match_filter"] = match_filter
+
+        def _run_download(options):
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(url, download=True)
+
+        try:
+            info = _run_download(opts)
+        except Exception as exc:
+            if live_detected["flag"]:
+                raise LiveStream(live_detected["message"]) from exc
+            if opts.get("cookiefile") and is_cookie_fallback_error(exc):
+                logger.warning(
+                    "yt-dlp-Download mit Cookies fehlgeschlagen (%s). Versuche ohne Cookies "
+                    "(Cookie-Session evtl. abgelaufen).",
+                    exc,
+                )
+                _mark_cookies_broken(cookies_file, str(exc))
+                fallback = dict(opts)
+                fallback.pop("cookiefile", None)
+                try:
+                    info = _run_download(fallback)
+                except Exception as retry_exc:
+                    if live_detected["flag"]:
+                        raise LiveStream(live_detected["message"]) from retry_exc
+                    raise
+            else:
+                raise
+
+        if live_detected["flag"] and not info:
+            raise LiveStream(live_detected["message"])
+
+        candidates: list[str] = []
+        for downloaded in (info or {}).get("requested_downloads") or []:
+            path = downloaded.get("filepath")
+            if path and os.path.exists(path):
+                candidates.append(path)
+        if not candidates:
+            candidates = [
+                os.path.join(os.path.dirname(out_base), name)
+                for name in os.listdir(os.path.dirname(out_base) or ".")
+                if name.startswith(os.path.basename(out_base) + ".")
+            ]
         candidates = [
-            os.path.join(os.path.dirname(out_base), name)
-            for name in os.listdir(os.path.dirname(out_base) or ".")
-            if name.startswith(os.path.basename(out_base) + ".")
+            path for path in candidates
+            if os.path.isfile(path) and not path.endswith((".part", ".ytdl", ".temp"))
         ]
-    candidates = [
-        path for path in candidates
-        if os.path.isfile(path) and not path.endswith((".part", ".ytdl", ".temp"))
-    ]
-    if not candidates:
-        raise RuntimeError("yt-dlp hat keine Ausgabedatei erzeugt")
+        if not candidates:
+            raise RuntimeError("yt-dlp hat keine Ausgabedatei erzeugt")
 
-    final_path = max(candidates, key=os.path.getsize)
-    return final_path, info or {}
+        final_path = max(candidates, key=os.path.getsize)
+        return final_path, info or {}
+    finally:
+        if cookie_temp:
+            try:
+                os.remove(cookie_temp)
+            except OSError:
+                pass
 
 
 class RssArchiver:
@@ -443,6 +651,12 @@ class RssArchiver:
         ytdlp_retries: int = 10,
         ytdlp_http_chunk_size: int = 10 * 1024 * 1024,
         ytdlp_format: str | None = None,
+        pot_provider_url: str | None = None,
+        proxy: str | None = None,
+        bot_pause_seconds: int = 3600,
+        live_max_age_days: int = 7,
+        retry_max_age_days: int = 30,
+        max_retries_per_poll: int = 3,
     ):
         self.on_item = on_item
         self.enabled = enabled
@@ -463,17 +677,39 @@ class RssArchiver:
         self.retention_days = max(1, int(retention_days))
         self.allow_live = allow_live
         self.cookies_file = cookies_file
+        self._last_cookie_mtime = _cookie_mtime(cookies_file)
         self.fetch_concurrency = max(1, int(fetch_concurrency))
         self.startup_delay = max(0, int(startup_delay))
         self.ytdlp_concurrent_fragments = max(1, int(ytdlp_concurrent_fragments))
         self.ytdlp_retries = max(0, int(ytdlp_retries))
         self.ytdlp_http_chunk_size = max(0, int(ytdlp_http_chunk_size))
         self.ytdlp_format = (ytdlp_format or "").strip() or None
+        self.pot_provider_url = (pot_provider_url or "").strip() or None
+        self.proxy = (proxy or "").strip() or None
+        self.bot_pause_seconds = max(0, int(bot_pause_seconds))
+        self.live_max_age_days = max(0, int(live_max_age_days))
+        self.retry_max_age_days = max(0, int(retry_max_age_days))
+        self.max_retries_per_poll = max(0, int(max_retries_per_poll))
 
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
         self._manual_task: asyncio.Task | None = None
+        self._worker_task: asyncio.Task | None = None
         self._stopping = False
+        self._blocked_until = 0.0
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+        self._queued_keys: set[str] = set()
+        self._queue_seq = 0
+        self._max_queue = max(1, self.max_items_per_poll * 2) if self.max_items_per_poll else 50
+        self._worker_busy = False
+        self._worker_summary = {
+            "archived": 0,
+            "skipped": 0,
+            "failed": 0,
+            "retry": 0,
+            "live": 0,
+            "deferred": 0,
+        }
         self._state = self._load_state()
         if self._migrate_state():
             self._save_state()
@@ -595,8 +831,10 @@ class RssArchiver:
         attempts: int = 0,
         next_retry: float = 0,
     ) -> None:
+        existing = self._state.get("items", {}).get(item.key) or {}
         entry = {
             "t": int(time.time()),
+            "first": int(existing.get("first") or existing.get("t") or time.time()),
             "s": status,
             "ch": item.channel[:120],
             "ti": item.title[:180],
@@ -653,8 +891,60 @@ class RssArchiver:
     def _prune_state(self) -> None:
         cutoff = time.time() - (self.retention_days * 86400)
         items = self._state.get("items", {})
-        for key in [k for k, v in items.items() if v.get("t", 0) < cutoff]:
+        for key in [
+            k for k, v in items.items()
+            if (v.get("first") or v.get("t", 0)) < cutoff
+        ]:
             items.pop(key, None)
+
+    def _expire_state_items(self) -> int:
+        """Gibt Retry-/Live-Items nach ihrer Maximalfrist endgueltig auf."""
+        now = time.time()
+        expired = 0
+        items = self._state.get("items", {})
+        for key, entry in list(items.items()):
+            if not isinstance(entry, dict):
+                continue
+            status = entry.get("s")
+            first = entry.get("first") or entry.get("t") or 0
+            reason = None
+            if (
+                status == "retry"
+                and self.retry_max_age_days
+                and first
+                and first < now - self.retry_max_age_days * 86400
+            ):
+                reason = f"Retry-Frist von {self.retry_max_age_days} Tagen abgelaufen"
+            elif (
+                status == "live"
+                and self.live_max_age_days
+                and first
+                and first < now - self.live_max_age_days * 86400
+            ):
+                reason = (
+                    f"Livestream/Premiere seit {self.live_max_age_days} Tagen "
+                    "nicht verfuegbar"
+                )
+            if not reason:
+                continue
+            entry["s"] = "skipped"
+            entry["r"] = reason[:240]
+            entry["next"] = 0
+            expired += 1
+            self._recent.append({
+                "time": int(now),
+                "channel": str(entry.get("ch") or ""),
+                "title": str(entry.get("ti") or "(ohne Titel)"),
+                "status": "skipped",
+                "reason": reason[:240],
+            })
+            logger.info(
+                "RSS: '%s' (%s) endgueltig aufgegeben: %s",
+                entry.get("ti") or key,
+                entry.get("ch") or "-",
+                reason,
+            )
+        return expired
 
     # ------------------------------------------------------------------ Feeds
 
@@ -858,6 +1148,8 @@ class RssArchiver:
             retries=self.ytdlp_retries,
             concurrent_fragments=self.ytdlp_concurrent_fragments,
             http_chunk_size=self.ytdlp_http_chunk_size,
+            pot_provider_url=self.pot_provider_url,
+            proxy=self.proxy,
         )
 
     async def download_video(
@@ -880,6 +1172,8 @@ class RssArchiver:
             concurrent_fragments=self.ytdlp_concurrent_fragments,
             http_chunk_size=self.ytdlp_http_chunk_size,
             format_selector=self.ytdlp_format,
+            pot_provider_url=self.pot_provider_url,
+            proxy=self.proxy,
         )
         return path
 
@@ -900,6 +1194,39 @@ class RssArchiver:
                 counts[status] += 1
         return counts
 
+    def _cookies_status(self) -> dict:
+        info = {
+            "path": self.cookies_file,
+            "exists": bool(self.cookies_file and os.path.exists(self.cookies_file)),
+            "mtime": None,
+            "size": None,
+            "usable": False,
+            "broken": False,
+            "reason": "",
+        }
+        if info["exists"]:
+            try:
+                stat = os.stat(self.cookies_file)
+                info["mtime"] = stat.st_mtime
+                info["size"] = stat.st_size
+            except OSError:
+                pass
+        if not info["exists"]:
+            # Datei wurde entfernt: alten "broken"-Status nicht weiter anzeigen.
+            _reset_cookie_state()
+        info["usable"] = _cookies_usable(self.cookies_file)
+        state = _cookie_state()
+        info["broken"] = bool(state.get("broken")) if info["exists"] else False
+        info["reason"] = state.get("reason", "") if info["exists"] else ""
+        if info["mtime"] and info["mtime"] != self._last_cookie_mtime:
+            if self._blocked_until > time.time():
+                logger.info(
+                    "Cookie-Datei wurde ersetzt, hebe YouTube-Bot-Check-Pause auf."
+                )
+            self._blocked_until = 0.0
+        self._last_cookie_mtime = info["mtime"]
+        return info
+
     def status(self) -> dict:
         feeds = []
         for feed in self._feeds:
@@ -913,12 +1240,23 @@ class RssArchiver:
             })
         return {
             "enabled": self.enabled,
-            "running": self._lock.locked(),
+            "running": self._lock.locked() or self._worker_busy,
+            "polling": self._lock.locked(),
+            "processing": self._worker_busy,
+            "queue": self._queue.qsize(),
+            "blocked_until": self._blocked_until,
+            "bot_pause_seconds": self.bot_pause_seconds,
+            "cookies": self._cookies_status(),
+            "pot_provider_url": self.pot_provider_url,
+            "proxy_enabled": bool(self.proxy),
             "interval_seconds": self.interval,
             "max_retries": self.max_retries,
             "retry_base_seconds": self.retry_base_seconds,
             "retry_max_delay_seconds": self.retry_max_delay_seconds,
             "live_recheck_seconds": self.live_recheck_seconds,
+            "live_max_age_days": self.live_max_age_days,
+            "retry_max_age_days": self.retry_max_age_days,
+            "max_retries_per_poll": self.max_retries_per_poll,
             "ytdlp_concurrent_fragments": self.ytdlp_concurrent_fragments,
             "ytdlp_retries": self.ytdlp_retries,
             "opml_file": self.opml_file,
@@ -929,6 +1267,7 @@ class RssArchiver:
             "last_trigger": self.last_trigger,
             "last_error": self.last_error,
             "last_summary": self.last_summary,
+            "worker_stats": dict(self._worker_summary),
             "counts": self._counts(),
             "feeds": feeds,
             "recent": list(self._recent[-15:]),
@@ -937,7 +1276,11 @@ class RssArchiver:
     def summary(self) -> dict:
         return {
             "enabled": self.enabled,
-            "running": self._lock.locked(),
+            "running": self._lock.locked() or self._worker_busy,
+            "polling": self._lock.locked(),
+            "processing": self._worker_busy,
+            "queue": self._queue.qsize(),
+            "blocked_until": self._blocked_until,
             "interval_seconds": self.interval,
             "feeds": len(self._feeds),
             "last_poll_finished": self.last_poll_finished,
@@ -961,15 +1304,44 @@ class RssArchiver:
         self._manual_task = asyncio.create_task(self.poll(trigger="backfill", backfill_limit=max(1, limit)))
         return True
 
+    def reset_retries(self) -> int:
+        """Setzt den Retry-Backoff aller wartenden Items zurueck (nach Cookie-Fix)."""
+        now = int(time.time())
+        reset = 0
+        for entry in self._state.get("items", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("s") == "retry":
+                entry["next"] = 0
+                entry["t"] = now
+                reset += 1
+        if reset:
+            self._blocked_until = 0.0
+            self._save_state()
+            logger.info("RSS: Retry-Backoff fuer %d Item(s) zurueckgesetzt.", reset)
+        return reset
+
+    def _enqueue(self, item: RssItem, priority: int) -> bool:
+        if item.key in self._queued_keys:
+            return False
+        if self._queue.qsize() >= self._max_queue:
+            return False
+        self._queued_keys.add(item.key)
+        self._queue_seq += 1
+        self._queue.put_nowait((priority, item.published or 0, self._queue_seq, item))
+        return True
+
     def start(self) -> None:
+        self._stopping = False
+        if self._worker_task is None or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker_loop())
         if self._task and not self._task.done():
             return
-        self._stopping = False
         self._task = asyncio.create_task(self._loop())
 
     def stop(self) -> None:
         self._stopping = True
-        for task in (self._task, self._manual_task):
+        for task in (self._task, self._manual_task, self._worker_task):
             if task and not task.done():
                 task.cancel()
 
@@ -978,15 +1350,42 @@ class RssArchiver:
             if self.startup_delay:
                 await asyncio.sleep(self.startup_delay)
             while not self._stopping:
+                started = time.time()
                 try:
                     await self.poll(trigger="auto")
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     logger.error("RSS-Poll fehlgeschlagen: %s", exc, exc_info=True)
-                await asyncio.sleep(self.interval)
+                elapsed = time.time() - started
+                await asyncio.sleep(max(0.0, self.interval - elapsed))
         except asyncio.CancelledError:
             logger.info("RSS-Poller gestoppt.")
+
+    async def _worker_loop(self) -> None:
+        """Verarbeitet die Warteschlange sequenziell, waehrend neue Feeds gepollt werden."""
+        logger.info("RSS-Worker gestartet.")
+        while not self._stopping:
+            try:
+                _priority, _published, _seq, item = await self._queue.get()
+            except asyncio.CancelledError:
+                raise
+            self._worker_busy = True
+            try:
+                await self._process_item(item, self._worker_summary)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "RSS-Worker: Verarbeitung von '%s' fehlgeschlagen: %s",
+                    item.title,
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                self._queued_keys.discard(item.key)
+                self._worker_busy = False
+                self._save_state()
 
     async def poll(self, trigger: str = "auto", backfill_limit: int = 0) -> dict:
         if self._lock.locked():
@@ -1004,6 +1403,9 @@ class RssArchiver:
                 "feeds": 0,
                 "items": 0,
                 "new": 0,
+                "selected": 0,
+                "queued": 0,
+                "expired": 0,
                 "archived": 0,
                 "skipped": 0,
                 "failed": 0,
@@ -1015,6 +1417,11 @@ class RssArchiver:
             }
 
             try:
+                expired = self._expire_state_items()
+                if expired:
+                    summary["expired"] = expired
+                    self._save_state()
+
                 feeds = self.load_feeds()
                 summary["feeds"] = len(feeds)
                 if not feeds:
@@ -1135,44 +1542,71 @@ class RssArchiver:
                         continue
                     candidates.append(item)
 
-                # Live zuerst, dann Retries, danach neue Items.
+                # Neue Videos zuerst, dann Live-Checks, danach Retries. So
+                # verdrängen Altlasten keine frisch erschienenen Videos.
                 def _candidate_priority(item: RssItem) -> tuple[int, float]:
                     status = self._state.get("items", {}).get(item.key, {}).get("s")
-                    if status == "live":
-                        return 0, item.published or 0
                     if status == "retry":
+                        return 2, item.published or 0
+                    if status == "live":
                         return 1, item.published or 0
-                    return 2, item.published or 0
+                    return 0, item.published or 0
 
                 candidates.sort(key=_candidate_priority)
                 summary["new"] = len(candidates)
-                if self.max_items_per_poll and len(candidates) > self.max_items_per_poll:
+                selected_items: list[RssItem] = []
+                retries_taken = 0
+                for item in candidates:
+                    status = self._state.get("items", {}).get(item.key, {}).get("s")
+                    if status == "retry":
+                        if (
+                            self.max_retries_per_poll
+                            and retries_taken >= self.max_retries_per_poll
+                        ):
+                            continue
+                        retries_taken += 1
+                    selected_items.append(item)
+                    if (
+                        self.max_items_per_poll
+                        and len(selected_items) >= self.max_items_per_poll
+                    ):
+                        break
+                summary["selected"] = len(selected_items)
+                if len(candidates) > len(selected_items):
                     logger.info(
-                        "RSS-Poll: %d Video(s) faellig, verarbeite zunaechst %d (Rest folgt im naechsten Lauf).",
+                        "RSS-Poll: %d Video(s) faellig, %d eingereiht (Rest folgt im naechsten Lauf).",
                         len(candidates),
-                        self.max_items_per_poll,
+                        len(selected_items),
                     )
-                    candidates = candidates[: self.max_items_per_poll]
                 elif candidates:
                     logger.info("RSS-Poll: %d faellige(s) Video(s) gefunden.", len(candidates))
 
-                for item in candidates:
-                    if self._stopping:
-                        break
-                    await self._process_item(item, summary)
-                    self._save_state()
+                queued = 0
+                for item in selected_items:
+                    status = self._state.get("items", {}).get(item.key, {}).get("s")
+                    priority = 2 if status == "retry" else (1 if status == "live" else 0)
+                    if self._enqueue(item, priority):
+                        queued += 1
+                summary["queued"] = queued
+                summary["pending"] = self._queue.qsize()
+                if queued < len(selected_items):
+                    logger.info(
+                        "RSS-Poll: Queue voll (%d), %d Video(s) warten auf den naechsten Lauf.",
+                        self._queue.qsize(),
+                        len(selected_items) - queued,
+                    )
 
                 self._prune_state()
                 self._save_state()
                 summary["finished_at"] = time.time()
                 self.last_summary = summary
                 logger.info(
-                    "RSS-Poll beendet: %d faellig, %d archiviert, %d uebersprungen, %d warten (retry/live), %d Fehler.",
+                    "RSS-Poll beendet: %d faellig, %d eingereiht, %d in Queue, %d abgelaufen, %d Feed-Fehler.",
                     summary["new"],
-                    summary["archived"],
-                    summary["skipped"],
-                    summary["retry"] + summary["live"],
-                    summary["failed"],
+                    summary["queued"],
+                    self._queue.qsize(),
+                    summary["expired"],
+                    summary["feed_errors"],
                 )
                 return summary
 
@@ -1200,6 +1634,19 @@ class RssArchiver:
         logger.info("RSS: '%s' (%s) uebersprungen: %s", item.title, item.channel, reason)
 
     def _mark_live(self, item: RssItem, summary: dict, reason: str) -> None:
+        first = self._state.get("items", {}).get(item.key, {}).get("first") or 0
+        age_base = item.published or first
+        if (
+            self.live_max_age_days
+            and age_base
+            and time.time() - age_base > self.live_max_age_days * 86400
+        ):
+            self._mark_skipped(
+                item,
+                summary,
+                f"Livestream/Premiere seit {self.live_max_age_days} Tagen nicht verfuegbar",
+            )
+            return
         previous = self._state.get("items", {}).get(item.key, {}).get("s")
         attempts = self._attempts(item.key) + 1
         next_retry = time.time() + self.live_recheck_seconds
@@ -1221,7 +1668,51 @@ class RssArchiver:
             self.live_recheck_seconds,
         )
 
+    def _defer_bot_pause(self, item: RssItem, summary: dict) -> None:
+        """Stellt ein YouTube-Item waehrend der Bot-Check-Pause zurueck (ohne Netzwerk)."""
+        entry = self._state.get("items", {}).get(item.key)
+        if entry is not None:
+            entry["next"] = max(int(entry.get("next") or 0), int(self._blocked_until))
+        else:
+            self._mark(
+                item,
+                "retry",
+                "YouTube-Bot-Check: Pause aktiv",
+                attempts=0,
+                next_retry=self._blocked_until,
+            )
+        summary["deferred"] = summary.get("deferred", 0) + 1
+        logger.debug(
+            "RSS: '%s' wegen YouTube-Bot-Check-Pause bis %s zurueckgestellt.",
+            item.title,
+            datetime.fromtimestamp(self._blocked_until, tz=timezone.utc).strftime("%H:%M:%S"),
+        )
+
+    async def _handle_error(
+        self,
+        item: RssItem,
+        summary: dict,
+        exc: Exception,
+        prefix: str = "",
+    ) -> None:
+        reason = f"{prefix}: {exc}" if prefix else f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, NotAVideo) or is_members_only_error(exc) or is_permanent_error(exc):
+            self._mark_skipped(item, summary, str(exc))
+        elif is_age_restricted_error(exc):
+            await self._record_failure(
+                item, summary, f"Altersbeschraenkt (Cookie-Account pruefen): {reason}"
+            )
+        elif is_bot_check_error(exc):
+            await self._record_failure(item, summary, reason, bot_check=True)
+        elif isinstance(exc, LiveStream) or is_live_error(exc):
+            self._mark_live(item, summary, str(exc))
+        else:
+            await self._record_failure(item, summary, reason)
+
     async def _process_item(self, item: RssItem, summary: dict) -> None:
+        if self._blocked_until > time.time() and item.platform == "youtube":
+            self._defer_bot_pause(item, summary)
+            return
         if not item.media_url and needs_probe(item.url):
             try:
                 info = await self.probe_video(item.url)
@@ -1233,12 +1724,7 @@ class RssArchiver:
                 self._mark_skipped(item, summary, str(exc))
                 return
             except Exception as exc:
-                if is_live_error(exc):
-                    self._mark_live(item, summary, str(exc))
-                elif is_permanent_error(exc):
-                    self._mark_skipped(item, summary, str(exc))
-                else:
-                    await self._record_failure(item, summary, f"Probe: {exc}")
+                await self._handle_error(item, summary, exc, prefix="Probe")
                 return
         logger.info(
             "RSS: Archiviere '%s' von %s (%s)...",
@@ -1263,24 +1749,61 @@ class RssArchiver:
                 self._mark_skipped(item, summary, "manuell abgebrochen")
             elif status == "live":
                 message = result.get("message") or "Live-Stream läuft noch"
-                self._mark_live(item, summary, str(message))
+                exc = Exception(str(message))
+                if is_members_only_error(exc) or is_permanent_error(exc):
+                    self._mark_skipped(item, summary, str(message))
+                elif is_age_restricted_error(exc):
+                    await self._record_failure(
+                        item,
+                        summary,
+                        f"Altersbeschraenkt (Cookie-Account pruefen): {message}",
+                    )
+                else:
+                    self._mark_live(item, summary, str(message))
             else:
                 message = result.get("message") or result.get("error") or "unbekannt"
-                if is_live_error(Exception(str(message))):
-                    self._mark_live(item, summary, str(message))
-                elif is_permanent_error(Exception(str(message))):
+                exc = Exception(str(message))
+                if is_members_only_error(exc) or is_permanent_error(exc):
                     self._mark_skipped(item, summary, str(message))
+                elif is_age_restricted_error(exc):
+                    await self._record_failure(
+                        item,
+                        summary,
+                        f"Altersbeschraenkt (Cookie-Account pruefen): {message}",
+                    )
+                elif is_bot_check_error(exc):
+                    await self._record_failure(
+                        item, summary, f"Pipeline: {message}", bot_check=True
+                    )
+                elif is_live_error(exc):
+                    self._mark_live(item, summary, str(message))
                 else:
                     await self._record_failure(item, summary, f"Pipeline: {message}")
         except Exception as exc:
-            if isinstance(exc, LiveStream) or is_live_error(exc):
-                self._mark_live(item, summary, str(exc))
-            elif isinstance(exc, NotAVideo) or is_permanent_error(exc):
-                self._mark_skipped(item, summary, str(exc))
-            else:
-                await self._record_failure(item, summary, f"{type(exc).__name__}: {exc}")
+            await self._handle_error(item, summary, exc)
 
-    async def _record_failure(self, item: RssItem, summary: dict, reason: str) -> None:
+    async def _record_failure(
+        self,
+        item: RssItem,
+        summary: dict,
+        reason: str,
+        bot_check: bool = False,
+    ) -> None:
+        if bot_check:
+            now = time.time()
+            was_paused = self._blocked_until > now
+            if self.bot_pause_seconds:
+                self._blocked_until = max(
+                    self._blocked_until, now + self.bot_pause_seconds
+                )
+            if not was_paused:
+                logger.warning(
+                    "YouTube-Bot-Check erkannt. Pausiere YouTube-Downloads fuer %ss. "
+                    "Bitte YTDLP_COOKIES_FILE und YTDLP_POT_PROVIDER_URL pruefen.",
+                    self.bot_pause_seconds,
+                )
+            self.last_error = f"YouTube-Bot-Check: {reason}"[:500]
+            reason = f"YouTube-Bot-Check: {reason}"
         attempts = self._attempts(item.key) + 1
         next_retry = 0
         if self.max_retries and attempts >= self.max_retries:

@@ -14,6 +14,7 @@ Telegram-Archiv fuer Streamrecorder-VODs (per n8n) und fuer rss.app-Feeds.
 | `GET` | `/health` | Status inkl. RSS-Zusammenfassung |
 | `POST` | `/rss/check` | RSS-Poll manuell ausloesen (`202` gestartet, `409` laeuft bereits) |
 | `POST` | `/rss/backfill?limit=10` | Einmalig die neuesten N bestehenden Videos nacharchivieren |
+| `POST` | `/rss/retry` | Retry-Backoff zuruecksetzen (Dashboard-Session noetig) |
 | `GET` | `/rss/status` | RSS-Feeds, Zaehler, letzter Lauf, Fehler |
 | `POST` | `/n8n/run?name=<key>` | n8n-Workflow per Webhook starten (Dashboard-Session noetig) |
 | `POST` | `/voduploader/api/jobs/cancel` | Wartenden/laufenden Job abbrechen (`{"key": "..."}`, Dashboard-Session noetig) |
@@ -119,18 +120,24 @@ wenn es ueber das Bundle `Gangstolking` gefunden wurde.
 | `RSS_MAX_ITEM_AGE_HOURS` | `48` | Schutz vor Massen-Backfill |
 | `RSS_MAX_ITEMS_PER_POLL` | `10` | Rest folgt im naechsten Lauf |
 | `RSS_MAX_RETRIES` | `0` | `0` = unbegrenzt; sonst nach N Versuchen `failed` |
+| `RSS_MAX_RETRIES_PER_POLL` | `3` | Max. Retry-Items pro Poll; neue Videos haben Vorrang |
 | `RSS_RETRY_BASE_SECONDS` | `900` | Erste Pause vor einem Retry |
 | `RSS_RETRY_MAX_DELAY_SECONDS` | `21600` | Maximales Backoff (6 h) |
+| `RSS_RETRY_MAX_AGE_DAYS` | `30` | Retry-Items nach so vielen Tagen aufgeben (0 = nie) |
 | `RSS_LIVE_RECHECK_SECONDS` | `900` | Erneute Pruefung von Live/Premiere |
+| `RSS_LIVE_MAX_AGE_DAYS` | `7` | Live/Premiere nach so vielen Tagen aufgeben (0 = nie) |
+| `RSS_BOT_PAUSE_SECONDS` | `3600` | Pause aller YouTube-Downloads nach einem Bot-Check |
 | `RSS_ALLOW_LIVE` | `false` | `true` = waehrend Live aufnehmen; `false` = nach Ende nachholen |
 | `RSS_TOPIC_PER_FEED` | `true` | Topic pro Quellkanal |
 | `RSS_ARCHIVE_CHAT_ID` | leer | Default: `TELEGRAM_CHAT_ID` |
 | `RSS_ARCHIVE_FORUM_CHAT_ID` | leer | Default: `TELEGRAM_FORUM_CHAT_ID` |
-| `YTDLP_COOKIES_FILE` | leer | Netscape-Cookies fuer Login-Pflicht |
+| `YTDLP_COOKIES_FILE` | `/app/ytdlp/cookies.txt` | Netscape-Cookies fuer YouTube/X |
+| `YTDLP_POT_PROVIDER_URL` | `http://bgutil-provider:4416` | PO-Token-Provider (bgutil) |
+| `YTDLP_PROXY` | leer | Optionaler Proxy fuer yt-dlp |
 | `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallele yt-dlp-Fragmente |
 | `YTDLP_RETRIES` | `10` | yt-dlp-Retries fuer Downloads |
 | `YTDLP_HTTP_CHUNK_SIZE` | `10485760` | HTTP-Chunk-Groesse in Bytes |
-| `YTDLP_FORMAT` | leer | Optionales Format-Limit, z. B. 1080p |
+| `YTDLP_FORMAT` | `bestvideo[height<=1080]+bestaudio/best` | Optionales Format-Limit |
 | `DOWNLOAD_CHUNK_SIZE` | `1048576` | Chunk-Groesse des direkten Downloaders |
 
 Der Erstlauf markiert die aktuell vorhandenen Items nur als gesehen. Ab dem
@@ -154,13 +161,28 @@ Im Dashboard gibt es dafuer den Button **10 nachholen**.
 Fehlgeschlagene Downloads werden nicht mehr nach zwei Versuchen verworfen.
 Standardmaessig (`RSS_MAX_RETRIES=0`) laufen sie unbegrenzt weiter, mit
 exponentiellem Backoff von 15 Minuten bis maximal 6 Stunden. Echte Dauerfehler
-(kein Video, privat, geloescht, entfernt) werden weiterhin uebersprungen.
+(kein Video, privat, geloescht, entfernt, Members-only) werden uebersprungen.
+
+- **Neue Videos haben Vorrang:** `RSS_MAX_RETRIES_PER_POLL` begrenzt, wie viele
+  Retry-Items pro Poll verarbeitet werden. Der Rest folgt im naechsten Lauf.
+- **Retry-Frist:** `RSS_RETRY_MAX_AGE_DAYS` (Default 30) gibt Dauerfehler
+  irgendwann endgueltig auf.
+- **Live-Frist:** `RSS_LIVE_MAX_AGE_DAYS` (Default 7) beendet 24/7-Streams und
+  Premieren, die nie als VOD verfuegbar werden.
+- **Bot-Check-Pause:** erkennt yt-dlp `Sign in to confirm you're not a bot`,
+  werden alle YouTube-Downloads fuer `RSS_BOT_PAUSE_SECONDS` (Default 1 h)
+  pausiert. Das verhindert eine Retry-Schleife, die die IP weiter auffaellt.
 
 Livestreams, Premieren und angekuendigte Streams bleiben als `live` in der
 Warteschlange. Sobald der Stream beendet und als VOD verfuegbar ist, wird er
 automatisch heruntergeladen. Mit `RSS_ALLOW_LIVE=true` wird stattdessen schon
 waehrend des Streams aufgenommen. Wartende Items werden auch dann weiter
 verfolgt, wenn sie inzwischen aus dem RSS-Feed gefallen sind.
+
+Feed-Discovery und Verarbeitung sind getrennt: Der Poll liest die Feeds alle
+15 Minuten und legt faellige Videos in eine Queue; ein Worker verarbeitet sie
+sequenziell. Ein mehrstuendiger Download blockiert dadurch nicht die Erkennung
+neuer Videos.
 
 ### Downloadgeschwindigkeit
 
@@ -172,15 +194,60 @@ zusaetzlich die Aufloesung begrenzen, wenn maximale Qualitaet nicht noetig ist:
 YTDLP_FORMAT=bestvideo[height<=1080]+bestaudio/best
 ```
 
-### 5. Cookies (optional)
+### 5. Cookies und PO-Token-Provider
 
-X/Twitter und manche YouTube-Videos verlangen Login. Netscape-Cookies als
-`vod-uploader/ytdlp/cookies.txt` ablegen, in `docker-compose.yml` den
-kommentierten Mount aktivieren und setzen:
+YouTube blockt Server-/Datacenter-IPs regelmaessig mit
+`Sign in to confirm you're not a bot`. Der Uploader kombiniert deshalb zwei
+Dinge:
+
+1. **Cookies** von einem Wegwerf-Google-Account (Netscape-Format).
+2. **PO-Token-Provider** (`bgutil-ytdlp-pot-provider`) als eigener Compose-Service.
+
+Cookies ablegen unter `vod-uploader/ytdlp/cookies.txt`. Das Verzeichnis ist in
+`docker-compose.yml` read-only nach `/app/ytdlp` gemountet. yt-dlp arbeitet mit
+einer schreibbaren Temp-Kopie, damit die Originaldatei durch Cookie-Rotation
+nicht veraendert wird:
+
+```yaml
+volumes:
+  - ./ytdlp:/app/ytdlp:ro
+```
 
 ```env
 YTDLP_COOKIES_FILE=/app/ytdlp/cookies.txt
+YTDLP_POT_PROVIDER_URL=http://bgutil-provider:4416
 ```
+
+**Cookies im laufenden Betrieb austauschen:** einfach
+`vod-uploader/ytdlp/cookies.txt` auf dem Host ersetzen. yt-dlp liest die Datei
+bei jedem Download/Probe neu; ein Neustart oder Rebuild ist nicht noetig.
+Danach im Dashboard **Retries zurücksetzen** druecken (oder
+`POST /voduploader/api/rss/retry`), damit die wartenden Items sofort erneut
+versucht werden.
+
+Hinweise:
+
+- Nur YouTube-Cookies in der Datei lassen (`.youtube.com`), keine Session-Cookies
+  von Banking, PayPal o. ae. Die Datei ist per `.gitignore` ausgeschlossen.
+- `chmod 600 vod-uploader/ytdlp/cookies.txt`.
+- Der PO-Provider laeuft nur im internen Docker-Netz (kein `ports:`-Mapping).
+- Reicht beides nicht (IP hart geblockt), kann `YTDLP_PROXY` auf einen
+  Residential-Proxy zeigen.
+
+**Wenn die Cookies nicht mehr funktionieren:**
+
+Das Dashboard zeigt dann `COOKIES UNGÜLTIG` (oder `YOUTUBE BLOCKIERT`). Die
+wichtigsten Auth-Cookies pruefen (Werte werden nicht angezeigt):
+
+```bash
+grep -oP '\t\K(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID|LOGIN_INFO)(?=\t)' \
+  vod-uploader/ytdlp/cookies.txt | sort -u
+```
+
+Fehlen `SID`, `HSID`, `SSID`, `APISID` oder `SAPISID`, ist der Export unvollstaendig
+oder die Session wurde von Google beendet. Dann neu exportieren, Datei
+ersetzen und **Retries zurücksetzen** druecken. Die Originaldatei wird von
+yt-dlp nicht mehr beschrieben (Temp-Kopie), kann also gefahrlos getauscht werden.
 
 ### 6. Start
 

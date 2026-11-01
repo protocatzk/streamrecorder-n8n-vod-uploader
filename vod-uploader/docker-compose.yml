@@ -1,9 +1,26 @@
 services:
+  # PO-Token-Provider fuer yt-dlp (YouTube-BotGuard). Laeuft nur im internen
+  # Docker-Netz und wird von vod_uploader ueber http://bgutil-provider:4416 erreicht.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    init: true
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
   vod_uploader:
     build: .
     container_name: vod_uploader
     restart: unless-stopped
     stop_grace_period: 30s
+    depends_on:
+      - bgutil-provider
     env_file:
       - .env
     environment:
@@ -36,10 +53,16 @@ services:
       - RSS_ARCHIVE_CHAT_ID
       - RSS_ARCHIVE_FORUM_CHAT_ID
       - YTDLP_COOKIES_FILE
+      - YTDLP_POT_PROVIDER_URL
+      - YTDLP_PROXY
       - YTDLP_CONCURRENT_FRAGMENTS
       - YTDLP_RETRIES
       - YTDLP_HTTP_CHUNK_SIZE
       - YTDLP_FORMAT
+      - RSS_BOT_PAUSE_SECONDS
+      - RSS_LIVE_MAX_AGE_DAYS
+      - RSS_RETRY_MAX_AGE_DAYS
+      - RSS_MAX_RETRIES_PER_POLL
       - DOWNLOAD_CHUNK_SIZE
       - N8N_WEBHOOKS
       - N8N_WEBHOOK_TIMEOUT
@@ -47,6 +70,7 @@ services:
       - STATE_DIR
       - JOB_DONE_TTL_DAYS
       - JOB_STALE_DAYS
+      - JOB_FAILED_TTL_DAYS
       - JOB_CANCEL_FORCE_AFTER_SECONDS
     deploy:
       resources:
@@ -58,11 +82,14 @@ services:
       - ./vod_bot_session.session:/app/vod_bot_session.session
       - ./rss_data:/app/rss_data
       - ./state_data:/app/state
+      # Verzeichnis-Mount, damit cookies.txt im laufenden Betrieb ausgetauscht
+      # werden kann (einfach die Host-Datei ersetzen, kein Neustart noetig).
+      # Read-only: yt-dlp arbeitet mit einer schreibbaren Temp-Kopie, damit die
+      # Originaldatei nicht durch Cookie-Rotation beschaedigt wird.
+      - ./ytdlp:/app/ytdlp:ro
       # OPML-Datei wird nicht mehr benoetigt, da RSS_FEED_URLS genutzt wird.
       # Fuer den Rueckfall auf eine lokale OPML wieder einkommentieren:
       # - ../rss-app-opml.xml:/app/rss-app-opml.xml:ro
-      # Optional: Netscape-Cookies fuer yt-dlp (X/Twitter/YouTube-Login)
-      # - ./ytdlp:/app/ytdlp:ro
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=traefik-net"
