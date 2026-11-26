@@ -187,26 +187,36 @@ function renderRss(rss) {
   document.getElementById('rssFailed').innerText = (counts.failed || 0) + (counts.retry || 0) + (counts.live || 0);
   document.getElementById('rssLastRun').innerText = formatTs(rss.last_poll_finished);
 
+  const notube = rss.notube || {};
+  const notubeFormat = notube.format ? `Format ${notube.format}` : '';
+
   if (!rss.enabled) {
     badge.className = 'badge badge-idle';
     badge.innerText = 'AUS';
-  } else if (rss.cookies && rss.cookies.broken) {
+  } else if (notube.cookies_file && notube.cookies_exists === false) {
     badge.className = 'badge badge-live';
-    badge.innerText = 'COOKIES UNGÜLTIG';
-    badge.title = rss.cookies.reason || 'Cookie-Datei ersetzen und Retries zurücksetzen';
+    badge.innerText = 'NOTUBE COOKIE FEHLT';
+    badge.title = notube.cookies_file;
   } else if (rss.blocked_until && rss.blocked_until > Date.now() / 1000) {
     badge.className = 'badge badge-live';
-    badge.innerText = 'YOUTUBE BLOCKIERT';
-    badge.title = 'Bot-Check aktiv – Cookies/PO-Provider prüfen';
+    badge.innerText = 'PAUSE';
+    badge.title = 'notube/YouTube-Pause aktiv – Cookies bzw. Limit prüfen';
   } else if (rss.running) {
     badge.className = 'badge badge-live';
     badge.innerText = rss.processing ? 'VERARBEITET' : 'LÄUFT';
+    badge.title = notubeFormat;
   } else if (rss.last_error) {
     badge.className = 'badge badge-idle';
     badge.innerText = 'FEHLER';
+    badge.title = rss.last_error;
+  } else if (notube.plus) {
+    badge.className = 'badge badge-idle';
+    badge.innerText = 'NOTUBE PLUS';
+    badge.title = notubeFormat || 'Plus-Session aktiv';
   } else {
     badge.className = 'badge badge-idle';
-    badge.innerText = 'BEREIT';
+    badge.innerText = 'NOTUBE FREE';
+    badge.title = notube.last_error || notubeFormat || 'Kein Plus-Abo erkannt';
   }
 
   const list = document.getElementById('rssFeedList');

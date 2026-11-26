@@ -3,5 +3,3 @@ aiohttp>=3.9.0
 cryptg>=0.4.0
 python-dotenv>=1.0.0
 feedparser>=6.0.11
-yt-dlp>=2025.5.22
-bgutil-ytdlp-pot-provider>=2.0.2

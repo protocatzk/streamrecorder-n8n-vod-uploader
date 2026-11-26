@@ -1,7 +1,7 @@
 """rss.app Feed-Archiver.
 
 Liest eine rss.app-OPML (oder einzelne Feed-URLs), erkennt Video-Items in den
-Feeds und archiviert sie. Die eigentliche Datei wird per yt-dlp aufgeloest,
+Feeds und archiviert sie. Die eigentliche Datei wird per notube.cc aufgeloest,
 weil rss.app selbst nur Post-/Watch-URLs und Thumbnails liefert.
 
 Der Archiver besitzt bewusst keine Telegram-Logik: er ruft fuer jedes Video
@@ -19,8 +19,6 @@ import logging
 import os
 import re
 import shutil
-import tempfile
-import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -30,6 +28,16 @@ from urllib.parse import urlparse
 
 import aiohttp
 import feedparser
+
+from notube_downloader import (
+    NotubeBusyError,
+    NotubeChallengeError,
+    NotubeClient,
+    NotubeError,
+    NotubeLimitError,
+    NotubePermanentError,
+    NotubePlusRequiredError,
+)
 
 logger = logging.getLogger('vod_uploader.rss')
 
@@ -151,17 +159,7 @@ PERMANENT_HINTS = NO_VIDEO_HINTS + MEMBERS_ONLY_HINTS + (
     "http 451",
 )
 
-# Fehler, bei denen ein zweiter Versuch ohne Cookies sinnvoll ist (kaputte oder
-# abgelaufene Login-Session liefert zwar Metadaten, aber keine Formate).
-# Ein Bot-Check gehoert bewusst NICHT hierher: er ist meist video-/IP-bezogen
-# und bedeutet nicht, dass die Cookie-Datei ungueltig ist.
-COOKIE_FALLBACK_HINTS = (
-    "requested format is not available",
-    "the page needs to be reloaded",
-    "login required",
-)
-
-# Hinweise auf Live/Upcoming/Premiere in yt-dlp-Fehlermeldungen.
+# Hinweise auf Live/Upcoming/Premiere in Downloader-Fehlermeldungen.
 LIVE_HINTS = (
     "live event will begin",
     "premieres in",
@@ -199,11 +197,6 @@ def is_members_only_error(exc: Exception) -> bool:
 def is_age_restricted_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(hint in message for hint in AGE_RESTRICTED_HINTS)
-
-
-def is_cookie_fallback_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(hint in message for hint in COOKIE_FALLBACK_HINTS)
 
 
 def is_live_error(exc: Exception) -> bool:
@@ -308,323 +301,6 @@ class RssItem:
         }
 
 
-class _YdlLogger:
-    """Leitet yt-dlp-Ausgaben in unser Logging um (statt auf stdout)."""
-
-    def debug(self, msg):
-        pass
-
-    def info(self, msg):
-        logger.debug("yt-dlp: %s", msg)
-
-    def warning(self, msg):
-        logger.warning("yt-dlp: %s", msg)
-
-    def error(self, msg):
-        logger.error("yt-dlp: %s", msg)
-
-
-# Cookie-Datei kann im Betrieb ausgetauscht werden. Wenn eine Session zwar den
-# Bot-Check umgeht, aber keine Formate liefert, wird sie bis zur naechsten
-# Aenderung der Datei (mtime) uebersprungen.
-_COOKIE_STATE_LOCK = threading.Lock()
-_COOKIE_STATE = {"mtime": None, "broken": False, "reason": ""}
-
-
-def _cookie_mtime(path: str | None) -> float | None:
-    if not path:
-        return None
-    try:
-        return os.path.getmtime(path)
-    except OSError:
-        return None
-
-
-def _cookies_usable(path: str | None) -> bool:
-    if not path or not os.path.exists(path):
-        return False
-    mtime = _cookie_mtime(path)
-    with _COOKIE_STATE_LOCK:
-        if _COOKIE_STATE["mtime"] != mtime:
-            _COOKIE_STATE["mtime"] = mtime
-            _COOKIE_STATE["broken"] = False
-            _COOKIE_STATE["reason"] = ""
-        return not _COOKIE_STATE["broken"]
-
-
-def _mark_cookies_broken(path: str | None, reason: str) -> None:
-    with _COOKIE_STATE_LOCK:
-        _COOKIE_STATE["mtime"] = _cookie_mtime(path)
-        _COOKIE_STATE["broken"] = True
-        _COOKIE_STATE["reason"] = str(reason)[:300]
-
-
-def _cookie_state() -> dict:
-    with _COOKIE_STATE_LOCK:
-        return dict(_COOKIE_STATE)
-
-
-def _reset_cookie_state() -> None:
-    with _COOKIE_STATE_LOCK:
-        _COOKIE_STATE["mtime"] = None
-        _COOKIE_STATE["broken"] = False
-        _COOKIE_STATE["reason"] = ""
-
-
-def _copy_cookie_file(path: str) -> str | None:
-    """Kopiert die Cookie-Datei nach /tmp, damit yt-dlp sie beschreiben kann.
-
-    Die Originaldatei bleibt dadurch unangetastet und kann im laufenden Betrieb
-    ausgetauscht werden. yt-dlp schreibt rotierte Cookies in die Kopie.
-    """
-    temp_path = None
-    try:
-        fd, temp_path = tempfile.mkstemp(prefix="ytdlp-cookies-", suffix=".txt")
-        with os.fdopen(fd, "wb") as dst, open(path, "rb") as src:
-            shutil.copyfileobj(src, dst)
-        os.chmod(temp_path, 0o600)
-        return temp_path
-    except OSError as exc:
-        logger.warning("Konnte Cookie-Datei nicht kopieren (%s): %s", path, exc)
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        return None
-
-
-def _ytdlp_options(
-    cookies_file: str | None,
-    *,
-    retries: int = 10,
-    concurrent_fragments: int = 4,
-    http_chunk_size: int = 10 * 1024 * 1024,
-    buffer_size: int = 1024 * 1024,
-    pot_provider_url: str | None = None,
-    proxy: str | None = None,
-) -> tuple[dict, str | None]:
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "noplaylist": True,
-        "socket_timeout": 30,
-        "retries": max(0, int(retries)),
-        "fragment_retries": max(0, int(retries)),
-        "concurrent_fragment_downloads": max(1, int(concurrent_fragments)),
-        "http_chunk_size": max(0, int(http_chunk_size)),
-        "buffersize": max(64 * 1024, int(buffer_size)),
-        "remote_components": ["ejs:github"],
-        "logger": _YdlLogger(),
-    }
-    cookie_temp = None
-    if cookies_file and _cookies_usable(cookies_file):
-        cookie_temp = _copy_cookie_file(cookies_file)
-        if cookie_temp:
-            opts["cookiefile"] = cookie_temp
-    if pot_provider_url:
-        # bgutil HTTP-Provider (docker-compose.yml: bgutil-provider)
-        opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [pot_provider_url]},
-        }
-    if proxy:
-        opts["proxy"] = proxy
-    return opts, cookie_temp
-
-
-def _live_message(info: dict) -> str:
-    if info.get("live_status") == "is_upcoming" or info.get("is_upcoming"):
-        return "Livestream/Premiere steht noch aus"
-    return "Live-Stream läuft noch"
-
-
-def _probe_sync(
-    url: str,
-    cookies_file: str | None,
-    allow_live: bool,
-    *,
-    retries: int = 10,
-    concurrent_fragments: int = 4,
-    http_chunk_size: int = 10 * 1024 * 1024,
-    pot_provider_url: str | None = None,
-    proxy: str | None = None,
-) -> dict:
-    """Prueft per yt-dlp, ob die URL ein (archivierbares) Video enthaelt."""
-    try:
-        import yt_dlp
-    except ImportError as exc:  # pragma: no cover - sollte im Image vorhanden sein
-        raise RuntimeError("yt-dlp ist nicht installiert") from exc
-
-    opts, cookie_temp = _ytdlp_options(
-        cookies_file,
-        retries=retries,
-        concurrent_fragments=concurrent_fragments,
-        http_chunk_size=http_chunk_size,
-        pot_provider_url=pot_provider_url,
-        proxy=proxy,
-    )
-    try:
-        opts["skip_download"] = True
-
-        def _probe(options):
-            with yt_dlp.YoutubeDL(options) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        try:
-            info = _probe(opts)
-        except Exception as exc:
-            if opts.get("cookiefile") and is_cookie_fallback_error(exc):
-                logger.warning(
-                    "yt-dlp-Probe mit Cookies fehlgeschlagen (%s). Versuche ohne Cookies "
-                    "(Cookie-Session evtl. abgelaufen).",
-                    exc,
-                )
-                _mark_cookies_broken(cookies_file, str(exc))
-                fallback = dict(opts)
-                fallback.pop("cookiefile", None)
-                info = _probe(fallback)
-            else:
-                raise
-
-        if not info:
-            raise NotAVideo("Keine Videoinformationen gefunden")
-
-        if info.get("_type") == "playlist":
-            entries = [entry for entry in (info.get("entries") or []) if entry]
-            if not entries:
-                raise NotAVideo("Leere Playlist")
-            info = entries[0]
-
-        if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
-            raise LiveStream(_live_message(info))
-
-        return info
-    finally:
-        if cookie_temp:
-            try:
-                os.remove(cookie_temp)
-            except OSError:
-                pass
-
-
-def _download_sync(
-    url: str,
-    out_base: str,
-    progress_callback: Callable[[int, int], None] | None,
-    cookies_file: str | None,
-    allow_live: bool,
-    *,
-    retries: int = 10,
-    concurrent_fragments: int = 4,
-    http_chunk_size: int = 10 * 1024 * 1024,
-    format_selector: str | None = None,
-    pot_provider_url: str | None = None,
-    proxy: str | None = None,
-) -> tuple[str, dict]:
-    try:
-        import yt_dlp
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("yt-dlp ist nicht installiert") from exc
-
-    def hook(data):
-        if not progress_callback:
-            return
-        if data.get("status") == "downloading":
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            done = data.get("downloaded_bytes") or 0
-            progress_callback(done, total)
-        elif data.get("status") == "finished":
-            total = data.get("total_bytes") or data.get("downloaded_bytes") or 0
-            progress_callback(total, total)
-
-    live_detected = {"flag": False, "message": "Live-Stream läuft noch"}
-
-    opts, cookie_temp = _ytdlp_options(
-        cookies_file,
-        retries=retries,
-        concurrent_fragments=concurrent_fragments,
-        http_chunk_size=http_chunk_size,
-        pot_provider_url=pot_provider_url,
-        proxy=proxy,
-    )
-    try:
-        opts.update({
-            "outtmpl": {"default": out_base + ".%(ext)s"},
-            "format": format_selector or "bestvideo*+bestaudio/best",
-            "merge_output_format": "mp4",
-            "overwrites": True,
-            "continuedl": True,
-            "progress_hooks": [hook],
-        })
-
-        def match_filter(info, *, incomplete=False):
-            if not allow_live and (info.get("is_live") or info.get("live_status") in ("is_live", "is_upcoming")):
-                live_detected["flag"] = True
-                live_detected["message"] = _live_message(info)
-                return "Live-Stream wird nicht archiviert"
-            return None
-
-        opts["match_filter"] = match_filter
-
-        def _run_download(options):
-            with yt_dlp.YoutubeDL(options) as ydl:
-                return ydl.extract_info(url, download=True)
-
-        try:
-            info = _run_download(opts)
-        except Exception as exc:
-            if live_detected["flag"]:
-                raise LiveStream(live_detected["message"]) from exc
-            if opts.get("cookiefile") and is_cookie_fallback_error(exc):
-                logger.warning(
-                    "yt-dlp-Download mit Cookies fehlgeschlagen (%s). Versuche ohne Cookies "
-                    "(Cookie-Session evtl. abgelaufen).",
-                    exc,
-                )
-                _mark_cookies_broken(cookies_file, str(exc))
-                fallback = dict(opts)
-                fallback.pop("cookiefile", None)
-                try:
-                    info = _run_download(fallback)
-                except Exception as retry_exc:
-                    if live_detected["flag"]:
-                        raise LiveStream(live_detected["message"]) from retry_exc
-                    raise
-            else:
-                raise
-
-        if live_detected["flag"] and not info:
-            raise LiveStream(live_detected["message"])
-
-        candidates: list[str] = []
-        for downloaded in (info or {}).get("requested_downloads") or []:
-            path = downloaded.get("filepath")
-            if path and os.path.exists(path):
-                candidates.append(path)
-        if not candidates:
-            candidates = [
-                os.path.join(os.path.dirname(out_base), name)
-                for name in os.listdir(os.path.dirname(out_base) or ".")
-                if name.startswith(os.path.basename(out_base) + ".")
-            ]
-        candidates = [
-            path for path in candidates
-            if os.path.isfile(path) and not path.endswith((".part", ".ytdl", ".temp"))
-        ]
-        if not candidates:
-            raise RuntimeError("yt-dlp hat keine Ausgabedatei erzeugt")
-
-        final_path = max(candidates, key=os.path.getsize)
-        return final_path, info or {}
-    finally:
-        if cookie_temp:
-            try:
-                os.remove(cookie_temp)
-            except OSError:
-                pass
-
-
 class RssArchiver:
     def __init__(
         self,
@@ -643,16 +319,19 @@ class RssArchiver:
         live_recheck_seconds: int = 900,
         retention_days: int = 90,
         allow_live: bool = False,
-        cookies_file: str | None = None,
+        notube_cookies_file: str | None = None,
+        notube_cookie: str | None = None,
+        notube_format: str = "auto",
+        notube_lang: str = "de",
+        notube_servers: str | Iterable[int] | None = None,
+        notube_request_timeout: int = 3600,
+        notube_inactivity_timeout: int = 120,
+        notube_proxy: str | None = None,
+        notube_captcha_provider: str | None = None,
+        notube_captcha_api_key: str | None = None,
         fetch_concurrency: int = 5,
         startup_delay: int = 20,
         enabled: bool = True,
-        ytdlp_concurrent_fragments: int = 4,
-        ytdlp_retries: int = 10,
-        ytdlp_http_chunk_size: int = 10 * 1024 * 1024,
-        ytdlp_format: str | None = None,
-        pot_provider_url: str | None = None,
-        proxy: str | None = None,
         bot_pause_seconds: int = 3600,
         live_max_age_days: int = 7,
         retry_max_age_days: int = 30,
@@ -676,16 +355,20 @@ class RssArchiver:
         self.live_recheck_seconds = max(60, int(live_recheck_seconds))
         self.retention_days = max(1, int(retention_days))
         self.allow_live = allow_live
-        self.cookies_file = cookies_file
-        self._last_cookie_mtime = _cookie_mtime(cookies_file)
+        self.notube = NotubeClient(
+            cookies_file=notube_cookies_file,
+            cookie_header=notube_cookie,
+            lang=notube_lang,
+            format=notube_format,
+            servers=notube_servers,
+            request_timeout=notube_request_timeout,
+            inactivity_timeout=notube_inactivity_timeout,
+            proxy=notube_proxy,
+            captcha_provider=notube_captcha_provider,
+            captcha_api_key=notube_captcha_api_key,
+        )
         self.fetch_concurrency = max(1, int(fetch_concurrency))
         self.startup_delay = max(0, int(startup_delay))
-        self.ytdlp_concurrent_fragments = max(1, int(ytdlp_concurrent_fragments))
-        self.ytdlp_retries = max(0, int(ytdlp_retries))
-        self.ytdlp_http_chunk_size = max(0, int(ytdlp_http_chunk_size))
-        self.ytdlp_format = (ytdlp_format or "").strip() or None
-        self.pot_provider_url = (pot_provider_url or "").strip() or None
-        self.proxy = (proxy or "").strip() or None
         self.bot_pause_seconds = max(0, int(bot_pause_seconds))
         self.live_max_age_days = max(0, int(live_max_age_days))
         self.retry_max_age_days = max(0, int(retry_max_age_days))
@@ -815,7 +498,7 @@ class RssArchiver:
         if status in ("archived", "skipped", "failed", "baseline"):
             return True
         if status == "live":
-            # Live/Premiere bleibt in Beobachtung, bis yt-dlp kein Live mehr meldet.
+            # Live/Premiere bleibt in Beobachtung, bis das Video als VOD vorliegt.
             return self._next_retry(key) > time.time()
         if status == "retry":
             if self.max_retries and self._attempts(key) >= self.max_retries:
@@ -1140,17 +823,7 @@ class RssArchiver:
     # ------------------------------------------------------------------ Video
 
     async def probe_video(self, url: str) -> dict:
-        return await asyncio.to_thread(
-            _probe_sync,
-            url,
-            self.cookies_file,
-            self.allow_live,
-            retries=self.ytdlp_retries,
-            concurrent_fragments=self.ytdlp_concurrent_fragments,
-            http_chunk_size=self.ytdlp_http_chunk_size,
-            pot_provider_url=self.pot_provider_url,
-            proxy=self.proxy,
-        )
+        return await self.notube.probe(url)
 
     async def download_video(
         self,
@@ -1158,24 +831,17 @@ class RssArchiver:
         out_base: str,
         progress_callback: Callable[[int, int], None] | None = None,
         probe: bool = False,
+        cancel_check: Callable[[], None] | None = None,
     ) -> str:
         if probe:
             await self.probe_video(url)
-        path, _info = await asyncio.to_thread(
-            _download_sync,
-            url,
+        job = await self.notube.resolve(url)
+        return await self.notube.download(
+            job,
             out_base,
-            progress_callback,
-            self.cookies_file,
-            self.allow_live,
-            retries=self.ytdlp_retries,
-            concurrent_fragments=self.ytdlp_concurrent_fragments,
-            http_chunk_size=self.ytdlp_http_chunk_size,
-            format_selector=self.ytdlp_format,
-            pot_provider_url=self.pot_provider_url,
-            proxy=self.proxy,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )
-        return path
 
     # ------------------------------------------------------------------ Poll
 
@@ -1193,39 +859,6 @@ class RssArchiver:
             if status in counts:
                 counts[status] += 1
         return counts
-
-    def _cookies_status(self) -> dict:
-        info = {
-            "path": self.cookies_file,
-            "exists": bool(self.cookies_file and os.path.exists(self.cookies_file)),
-            "mtime": None,
-            "size": None,
-            "usable": False,
-            "broken": False,
-            "reason": "",
-        }
-        if info["exists"]:
-            try:
-                stat = os.stat(self.cookies_file)
-                info["mtime"] = stat.st_mtime
-                info["size"] = stat.st_size
-            except OSError:
-                pass
-        if not info["exists"]:
-            # Datei wurde entfernt: alten "broken"-Status nicht weiter anzeigen.
-            _reset_cookie_state()
-        info["usable"] = _cookies_usable(self.cookies_file)
-        state = _cookie_state()
-        info["broken"] = bool(state.get("broken")) if info["exists"] else False
-        info["reason"] = state.get("reason", "") if info["exists"] else ""
-        if info["mtime"] and info["mtime"] != self._last_cookie_mtime:
-            if self._blocked_until > time.time():
-                logger.info(
-                    "Cookie-Datei wurde ersetzt, hebe YouTube-Bot-Check-Pause auf."
-                )
-            self._blocked_until = 0.0
-        self._last_cookie_mtime = info["mtime"]
-        return info
 
     def status(self) -> dict:
         feeds = []
@@ -1246,9 +879,7 @@ class RssArchiver:
             "queue": self._queue.qsize(),
             "blocked_until": self._blocked_until,
             "bot_pause_seconds": self.bot_pause_seconds,
-            "cookies": self._cookies_status(),
-            "pot_provider_url": self.pot_provider_url,
-            "proxy_enabled": bool(self.proxy),
+            "notube": self.notube.status(),
             "interval_seconds": self.interval,
             "max_retries": self.max_retries,
             "retry_base_seconds": self.retry_base_seconds,
@@ -1257,8 +888,6 @@ class RssArchiver:
             "live_max_age_days": self.live_max_age_days,
             "retry_max_age_days": self.retry_max_age_days,
             "max_retries_per_poll": self.max_retries_per_poll,
-            "ytdlp_concurrent_fragments": self.ytdlp_concurrent_fragments,
-            "ytdlp_retries": self.ytdlp_retries,
             "opml_file": self.opml_file,
             "opml_found": bool(self.opml_file and os.path.exists(self.opml_file)),
             "feed_titles": self.feed_titles,
@@ -1285,6 +914,7 @@ class RssArchiver:
             "feeds": len(self._feeds),
             "last_poll_finished": self.last_poll_finished,
             "last_error": self.last_error,
+            "notube": self.notube.status(),
             "counts": self._counts(),
         }
 
@@ -1344,6 +974,10 @@ class RssArchiver:
         for task in (self._task, self._manual_task, self._worker_task):
             if task and not task.done():
                 task.cancel()
+        try:
+            asyncio.get_running_loop().create_task(self.notube.close())
+        except RuntimeError:
+            pass
 
     async def _loop(self) -> None:
         try:
@@ -1396,6 +1030,10 @@ class RssArchiver:
             self.last_poll_started = started
             self.last_trigger = trigger
             self.last_error = None
+            try:
+                await self.notube.ensure_subscription()
+            except Exception as exc:
+                logger.debug("notube-Subscription-Check beim Poll fehlgeschlagen: %s", exc)
             summary = {
                 "status": "ok",
                 "trigger": trigger,
@@ -1696,8 +1334,22 @@ class RssArchiver:
         prefix: str = "",
     ) -> None:
         reason = f"{prefix}: {exc}" if prefix else f"{type(exc).__name__}: {exc}"
-        if isinstance(exc, NotAVideo) or is_members_only_error(exc) or is_permanent_error(exc):
+        if isinstance(exc, (NotAVideo, NotubePermanentError, NotubePlusRequiredError)):
             self._mark_skipped(item, summary, str(exc))
+        elif is_members_only_error(exc) or is_permanent_error(exc):
+            self._mark_skipped(item, summary, str(exc))
+        elif isinstance(exc, NotubeChallengeError):
+            await self._record_failure(
+                item,
+                summary,
+                f"notube-Captcha: {reason}",
+                bot_check=True,
+                pause_label="notube-Cloudflare-Captcha",
+            )
+        elif isinstance(exc, NotubeLimitError):
+            await self._record_failure(item, summary, f"notube-Limit: {reason}")
+        elif isinstance(exc, NotubeBusyError):
+            await self._record_failure(item, summary, f"notube ausgelastet: {reason}")
         elif is_age_restricted_error(exc):
             await self._record_failure(
                 item, summary, f"Altersbeschraenkt (Cookie-Account pruefen): {reason}"
@@ -1745,6 +1397,20 @@ class RssArchiver:
                     "status": "archived",
                     "reason": "",
                 })
+            elif status == "skipped" and result.get("permanent"):
+                self._mark_skipped(
+                    item,
+                    summary,
+                    str(result.get("message") or "uebersprungen"),
+                )
+            elif status == "challenge":
+                await self._record_failure(
+                    item,
+                    summary,
+                    str(result.get("message") or "notube-Captcha"),
+                    bot_check=True,
+                    pause_label="notube-Cloudflare-Captcha",
+                )
             elif status == "cancelled":
                 self._mark_skipped(item, summary, "manuell abgebrochen")
             elif status == "live":
@@ -1788,6 +1454,7 @@ class RssArchiver:
         summary: dict,
         reason: str,
         bot_check: bool = False,
+        pause_label: str = "YouTube-Bot-Check",
     ) -> None:
         if bot_check:
             now = time.time()
@@ -1798,12 +1465,13 @@ class RssArchiver:
                 )
             if not was_paused:
                 logger.warning(
-                    "YouTube-Bot-Check erkannt. Pausiere YouTube-Downloads fuer %ss. "
-                    "Bitte YTDLP_COOKIES_FILE und YTDLP_POT_PROVIDER_URL pruefen.",
+                    "%s erkannt. Pausiere YouTube-Downloads fuer %ss. "
+                    "Bitte notube-Cookies (NOTUBE_COOKIES_FILE) pruefen.",
+                    pause_label,
                     self.bot_pause_seconds,
                 )
-            self.last_error = f"YouTube-Bot-Check: {reason}"[:500]
-            reason = f"YouTube-Bot-Check: {reason}"
+            self.last_error = f"{pause_label}: {reason}"[:500]
+            reason = f"{pause_label}: {reason}"
         attempts = self._attempts(item.key) + 1
         next_retry = 0
         if self.max_retries and attempts >= self.max_retries:

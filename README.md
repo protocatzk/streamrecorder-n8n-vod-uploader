@@ -3,10 +3,10 @@
 Automatisiertes Video-Archiv: **n8n** liest neue Streamrecorder-Recordings aus und
 uebergibt sie an einen **Telegram-Bot**, der sie herunterlaedt, bei Bedarf
 aufteilt und in Telegram-Foren ablegt. Zusaetzlich archiviert der Bot Videos aus
-**rss.app-Feeds** per `yt-dlp`.
+**rss.app-Feeds** per `notube.cc`.
 
 > Inoffizielles Privatprojekt. Keine Verbindung zu Streamrecorder, Telegram,
-> n8n, rss.app oder yt-dlp. Nutzung auf eigene Verantwortung.
+> n8n, rss.app oder notube.cc. Nutzung auf eigene Verantwortung.
 
 ## Inhalt
 
@@ -31,7 +31,7 @@ aufteilt und in Telegram-Foren ablegt. Zusaetzlich archiviert der Bot Videos aus
 - **Dynamische Zielkanäle**: Die n8n-Workflows lesen die abonnierten TargetIDs
   bei jedem Lauf live aus dem Streamrecorder-Account, statt sie zu pflegen.
 - **RSS-Archiv**: rss.app-Feeds (YouTube, TikTok, X, Instagram, ...) werden per
-  `yt-dlp` aufgeloest und durch dieselbe Pipeline geschickt.
+  `notube.cc` aufgeloest und durch dieselbe Pipeline geschickt.
 - **Dashboard** mit Login, Queue, aktivem Upload, Historie, Logs, RSS-Status,
   Topic-Verwaltung und Buttons zum Starten der n8n-Workflows.
 - **Persistenter Job-State**: Neustarts/Deploys verlieren keine Jobs; bereits
@@ -114,8 +114,8 @@ Die wichtigsten Variablen:
 | `DOWNLOAD_INACTIVITY_TIMEOUT` | Abbruch bei Inaktivitaet in Sekunden |
 | `RSS_ENABLED` / `RSS_FEED_URLS` | RSS-Archiv und Feeds |
 | `RSS_ARCHIVE_CHAT_ID` / `RSS_ARCHIVE_FORUM_CHAT_ID` | Ziele fuer RSS-Uploads |
-| `YTDLP_COOKIES_FILE` | Netscape-Cookies fuer YouTube/X (Default `/app/ytdlp/cookies.txt`) |
-| `YTDLP_POT_PROVIDER_URL` | PO-Token-Provider (Default `http://bgutil-provider:4416`) |
+| `NOTUBE_COOKIES_FILE` | notube-Cookies (Default `/app/ytdlp/notube_cookies.txt`) |
+| `NOTUBE_FORMAT` | `auto` (Plus: `mp42k`, sonst `mp4hd`) |
 | `N8N_WEBHOOKS` | Webhook-URLs fuer die Dashboard-Buttons (`name=url,...`) |
 | `STATE_DIR` | Pfad des Job-Spools (Default `/app/state`) |
 | `JOB_DONE_TTL_DAYS` | Duplikat-Gedaechtnis in Tagen (Default 14) |
@@ -246,8 +246,9 @@ Repository-Eigentuemer.
 Fremdkomponenten und ihre Lizenzen sind in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) aufgefuehrt, inklusive der
 vollstaendigen Lizenztexte. Das Docker-Image enthaelt unter anderem FFmpeg
-(GPL-2.0-or-later, Debian-Build), Telethon (MIT), aiohttp (Apache-2.0) und
-yt-dlp (Unlicense).
+(GPL-2.0-or-later, Debian-Build), Telethon (MIT) und aiohttp (Apache-2.0).
+Der Downloaddienst notube.cc wird nur ueber HTTP angesprochen und ist nicht
+Bestandteil des Images.
 
 **Inhaltliche Verantwortung:** Das Tool laedt Videos von Drittanbietern. Wer es
 betreibt, ist selbst dafuer verantwortlich, dass die Rechte an den Inhalten
@@ -266,7 +267,8 @@ mitgeliefert.
     ├── main.py                # aiohttp-Server, Dashboard, Upload-Pipeline
     ├── fast_uploader.py       # paralleler Telegram-Chunk-Upload (Telethon-Beispiel)
     ├── job_store.py           # persistenter Job-Spool mit Resume
-    ├── rss_archiver.py        # rss.app-Polling und yt-dlp-Download
+    ├── rss_archiver.py        # rss.app-Polling
+    ├── notube_downloader.py   # notube.cc-Download
     ├── topic_manager.py       # Forum-Topics und Alias-Cache
     ├── template_loader.py     # laedt HTML-Templates aus templates/
     ├── templates/             # login.html, dashboard.html, topics.html
@@ -287,7 +289,7 @@ mitgeliefert.
 | `401 Unauthorized` am Dashboard | Session abgelaufen (Neustart) – neu per Telegram einloggen |
 | n8n-Button liefert `Nicht verfuegbar` | `N8N_WEBHOOKS` leer oder Webhook im Workflow nicht aktiv |
 | `202 duplicate` im n8n-Log | Job laeuft bereits oder wurde bereits hochgeladen (gewollt) |
-| `Sign in to confirm you're not a bot` | YouTube blockt die Server-IP. Cookies in `vod-uploader/ytdlp/cookies.txt` erneuern, PO-Provider pruefen, danach **Retries zurücksetzen**. Details in `vod-uploader/README.md`. |
+| `NOTUBE COOKIE FEHLT` / notube-Fehler | `vod-uploader/ytdlp/notube_cookies.txt` ablegen bzw. erneuern, danach **Retries zurücksetzen**. Details in `vod-uploader/README.md`. |
 | RSS-Queue haengt an Dauerfehlern | Retry-Frist (`RSS_RETRY_MAX_AGE_DAYS`), Live-Frist (`RSS_LIVE_MAX_AGE_DAYS`) und Retry-Budget (`RSS_MAX_RETRIES_PER_POLL`) pruefen |
 | Upload haengt nach Neustart | Log auf `Setze gespeicherten Job fort` pruefen; Teile mit Message-ID werden uebersprungen |
 | Queue haengt an einem Job | Im Dashboard abbrechen (Button am aktiven Job); Details siehe `vod-uploader/README.md` |

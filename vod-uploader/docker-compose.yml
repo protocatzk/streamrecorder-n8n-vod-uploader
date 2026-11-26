@@ -1,26 +1,11 @@
 services:
-  # PO-Token-Provider fuer yt-dlp (YouTube-BotGuard). Laeuft nur im internen
-  # Docker-Netz und wird von vod_uploader ueber http://bgutil-provider:4416 erreicht.
-  bgutil-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    container_name: bgutil-provider
-    restart: unless-stopped
-    init: true
-    networks:
-      - default
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 512M
-
   vod_uploader:
     build: .
     container_name: vod_uploader
     restart: unless-stopped
     stop_grace_period: 30s
-    depends_on:
-      - bgutil-provider
+    ports:
+      - "127.0.0.1:8080:8080"
     env_file:
       - .env
     environment:
@@ -52,13 +37,16 @@ services:
       - RSS_TOPIC_PER_FEED
       - RSS_ARCHIVE_CHAT_ID
       - RSS_ARCHIVE_FORUM_CHAT_ID
-      - YTDLP_COOKIES_FILE
-      - YTDLP_POT_PROVIDER_URL
-      - YTDLP_PROXY
-      - YTDLP_CONCURRENT_FRAGMENTS
-      - YTDLP_RETRIES
-      - YTDLP_HTTP_CHUNK_SIZE
-      - YTDLP_FORMAT
+      - NOTUBE_COOKIES_FILE
+      - NOTUBE_COOKIE
+      - NOTUBE_FORMAT
+      - NOTUBE_LANG
+      - NOTUBE_SERVERS
+      - NOTUBE_REQUEST_TIMEOUT
+      - NOTUBE_INACTIVITY_TIMEOUT
+      - NOTUBE_PROXY
+      - NOTUBE_CAPTCHA_PROVIDER
+      - NOTUBE_CAPTCHA_API_KEY
       - RSS_BOT_PAUSE_SECONDS
       - RSS_LIVE_MAX_AGE_DAYS
       - RSS_RETRY_MAX_AGE_DAYS
@@ -82,31 +70,21 @@ services:
       - ./vod_bot_session.session:/app/vod_bot_session.session
       - ./rss_data:/app/rss_data
       - ./state_data:/app/state
-      # Verzeichnis-Mount, damit cookies.txt im laufenden Betrieb ausgetauscht
-      # werden kann (einfach die Host-Datei ersetzen, kein Neustart noetig).
-      # Read-only: yt-dlp arbeitet mit einer schreibbaren Temp-Kopie, damit die
-      # Originaldatei nicht durch Cookie-Rotation beschaedigt wird.
+      # Cookie-Verzeichnis (notube_cookies.txt). Der Bot liest die Datei bei
+      # jeder Anfrage neu, sie kann also im laufenden Betrieb ersetzt werden.
+      # Read-only: der Bot schreibt niemals in die Cookies.
       - ./ytdlp:/app/ytdlp:ro
       # OPML-Datei wird nicht mehr benoetigt, da RSS_FEED_URLS genutzt wird.
       # Fuer den Rueckfall auf eine lokale OPML wieder einkommentieren:
       # - ../rss-app-opml.xml:/app/rss-app-opml.xml:ro
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=traefik-net"
-      - "traefik.http.routers.voduploader.rule=Host(`02njtne.cserverhost.cloud`) && (PathPrefix(`/voduploader`) || PathPrefix(`/voduploader/`))"
-      - "traefik.http.routers.voduploader.entrypoints=websecure"
-      - "traefik.http.routers.voduploader.tls=true"
-      - "traefik.http.routers.voduploader.tls.certresolver=le"
-      - "traefik.http.services.voduploader.loadbalancer.server.port=8080"
+      - "wud.watch=false"
     networks:
       - default
       - n8n_n8n-network
-      - traefik-net
 
 networks:
   default:
   n8n_n8n-network:
-    external: true
-  traefik-net:
     external: true
 

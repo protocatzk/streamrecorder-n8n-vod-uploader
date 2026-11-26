@@ -23,7 +23,8 @@ from rss_archiver import (
     RssArchiver,
     RssItem,
     LiveStream,
-    is_bot_check_error,
+    NotubeChallengeError,
+    NotubePermanentError,
     is_live_error,
     is_members_only_error,
     is_permanent_error,
@@ -93,13 +94,26 @@ RSS_BOT_PAUSE_SECONDS = int(os.getenv('RSS_BOT_PAUSE_SECONDS', '3600'))
 RSS_LIVE_MAX_AGE_DAYS = int(os.getenv('RSS_LIVE_MAX_AGE_DAYS', '7'))
 RSS_RETRY_MAX_AGE_DAYS = int(os.getenv('RSS_RETRY_MAX_AGE_DAYS', '30'))
 RSS_MAX_RETRIES_PER_POLL = int(os.getenv('RSS_MAX_RETRIES_PER_POLL', '3'))
-YTDLP_COOKIES_FILE = os.getenv('YTDLP_COOKIES_FILE') or None
-YTDLP_POT_PROVIDER_URL = os.getenv('YTDLP_POT_PROVIDER_URL', 'http://bgutil-provider:4416').strip() or None
-YTDLP_PROXY = os.getenv('YTDLP_PROXY', '').strip() or None
-YTDLP_CONCURRENT_FRAGMENTS = int(os.getenv('YTDLP_CONCURRENT_FRAGMENTS', '4'))
-YTDLP_RETRIES = int(os.getenv('YTDLP_RETRIES', '10'))
-YTDLP_HTTP_CHUNK_SIZE = int(os.getenv('YTDLP_HTTP_CHUNK_SIZE', str(10 * 1024 * 1024)))
-YTDLP_FORMAT = os.getenv('YTDLP_FORMAT', '').strip() or None
+
+# --- notube.cc Download ---
+NOTUBE_COOKIES_FILE = os.getenv('NOTUBE_COOKIES_FILE') or '/app/ytdlp/notube_cookies.txt'
+if not os.path.exists(NOTUBE_COOKIES_FILE):
+    _local_notube_cookies = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'ytdlp', 'notube_cookies.txt'
+    )
+    if os.path.exists(_local_notube_cookies):
+        NOTUBE_COOKIES_FILE = _local_notube_cookies
+NOTUBE_COOKIE = os.getenv('NOTUBE_COOKIE', '').strip() or None
+NOTUBE_FORMAT = os.getenv('NOTUBE_FORMAT', 'auto').strip() or 'auto'
+NOTUBE_LANG = os.getenv('NOTUBE_LANG', 'de').strip() or 'de'
+NOTUBE_SERVERS = os.getenv('NOTUBE_SERVERS', '40-76').strip() or '40-76'
+NOTUBE_REQUEST_TIMEOUT = int(os.getenv('NOTUBE_REQUEST_TIMEOUT', '3600'))
+NOTUBE_INACTIVITY_TIMEOUT = int(
+    os.getenv('NOTUBE_INACTIVITY_TIMEOUT', str(DOWNLOAD_INACTIVITY_TIMEOUT))
+)
+NOTUBE_PROXY = os.getenv('NOTUBE_PROXY', '').strip() or None
+NOTUBE_CAPTCHA_PROVIDER = os.getenv('NOTUBE_CAPTCHA_PROVIDER', '').strip() or None
+NOTUBE_CAPTCHA_API_KEY = os.getenv('NOTUBE_CAPTCHA_API_KEY', '').strip() or None
 
 # --- n8n Workflows (Dashboard-Buttons) ---
 def parse_n8n_webhooks(raw: str) -> dict[str, str]:
@@ -672,7 +686,9 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
     streamer = data.get("streamer", "Unbekannt")
     title = data.get("title", "Livestream Recording")
     source = str(data.get("source") or "streamrecorder")
-    use_ytdlp = bool(data.get("use_ytdlp"))
+    use_rss_downloader = bool(
+        data.get("download_backend") == "notube" or data.get("use_ytdlp")
+    )
     source_url = data.get("source_url")
 
     job_info = {
@@ -838,20 +854,21 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                     if state.active_job:
                         state.active_job['bytes_done'] = done
                         state.active_job['bytes_total'] = total
-                        state.active_job['pct'] = int(done / total * 100) if total else 0
+                        state.active_job['pct'] = min(100, int(done / total * 100)) if total else 0
                         state.active_job['stage'] = 'downloading'
                         state.active_job['stage_label'] = download_label
 
                 try:
-                    if use_ytdlp:
+                    if use_rss_downloader:
                         if state.active_job:
-                            state.active_job['stage_label'] = "Video-Analyse (yt-dlp)"
+                            state.active_job['stage_label'] = "Download (notube)"
                         temp_video = await rss_archiver.download_video(
                             download_url,
                             os.path.join(job_dir, f"stream_{job_id}"),
-                            progress_callback=dl_progress
+                            progress_callback=dl_progress,
+                            cancel_check=cancel_check,
                         )
-                        logger.info(f"[{job_id}] yt-dlp-Download abgeschlossen: {os.path.basename(temp_video)}")
+                        logger.info(f"[{job_id}] notube-Download abgeschlossen: {os.path.basename(temp_video)}")
                     else:
                         await download_file(download_url, temp_video, progress_callback=dl_progress, inactivity_timeout=DOWNLOAD_INACTIVITY_TIMEOUT, cancel_check=cancel_check)
                 except JobCancelled:
@@ -868,8 +885,28 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         "message": str(live_err)
                     }, 200
                 except Exception as dl_err:
+                    if isinstance(dl_err, NotubeChallengeError):
+                        logger.warning(
+                            f"[{job_id}] notube verlangt eine Cloudflare-Captcha "
+                            f"({dl_err}). Download wird spaeter erneut versucht."
+                        )
+                        if state.active_job and state.active_job.get("job_id") == job_id:
+                            state.active_job['stage'] = 'waiting'
+                            state.active_job['stage_label'] = "notube-Captcha – Retry folgt"
+                        keep_files = True
+                        try:
+                            JOB_STORE.fail(key, str(dl_err))
+                        except Exception as store_err:
+                            logger.warning(
+                                f"[{job_id}] Konnte Job-State nicht speichern: {store_err}"
+                            )
+                        return {
+                            "status": "challenge",
+                            "job_id": job_id,
+                            "message": f"notube-Captcha erforderlich ({dl_err}).",
+                        }, 200
                     if (
-                        use_ytdlp
+                        use_rss_downloader
                         and is_live_error(dl_err)
                         and not is_permanent_error(dl_err)
                         and not is_members_only_error(dl_err)
@@ -884,7 +921,11 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                             "job_id": job_id,
                             "message": str(dl_err)
                         }, 200
-                    is_permanent = is_members_only_error(dl_err) or is_permanent_error(dl_err)
+                    is_permanent = (
+                        is_members_only_error(dl_err)
+                        or is_permanent_error(dl_err)
+                        or isinstance(dl_err, NotubePermanentError)
+                    )
                     if is_permanent:
                         logger.warning(
                             f"[{job_id}] Download endgueltig fehlgeschlagen ({dl_err}). "
@@ -896,12 +937,13 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         JOB_STORE.complete(key, status="skipped", remember=False)
                         return {
                             "status": "skipped",
+                            "permanent": True,
                             "job_id": job_id,
                             "message": f"Download endgueltig fehlgeschlagen ({dl_err})."
                         }, 200
 
-                    # Transienter Fehler: Teildownload behalten, damit yt-dlp bzw.
-                    # der Range-Downloader beim naechsten Versuch weiterladen kann.
+                    # Transienter Fehler: Job-Verzeichnis behalten. notube kann
+                    # nicht fortsetzen, der Range-Downloader dagegen schon.
                     keep_files = True
                     try:
                         JOB_STORE.fail(key, str(dl_err))
@@ -1324,7 +1366,7 @@ async def archive_rss_item(item: RssItem) -> dict:
     duration = format_duration_seconds(item.duration) if item.duration else "N/A"
     job_data = {
         "download_url": item.url,
-        "use_ytdlp": True,
+        "download_backend": "notube",
         "source": "rss",
         "source_url": item.url,
         "recording_id": item.recording_id,
@@ -1374,14 +1416,17 @@ rss_archiver = RssArchiver(
     live_recheck_seconds=RSS_LIVE_RECHECK_SECONDS,
     retention_days=RSS_RETENTION_DAYS,
     allow_live=RSS_ALLOW_LIVE,
-    cookies_file=YTDLP_COOKIES_FILE,
+    notube_cookies_file=NOTUBE_COOKIES_FILE,
+    notube_cookie=NOTUBE_COOKIE,
+    notube_format=NOTUBE_FORMAT,
+    notube_lang=NOTUBE_LANG,
+    notube_servers=NOTUBE_SERVERS,
+    notube_request_timeout=NOTUBE_REQUEST_TIMEOUT,
+    notube_inactivity_timeout=NOTUBE_INACTIVITY_TIMEOUT,
+    notube_proxy=NOTUBE_PROXY,
+    notube_captcha_provider=NOTUBE_CAPTCHA_PROVIDER,
+    notube_captcha_api_key=NOTUBE_CAPTCHA_API_KEY,
     enabled=RSS_ENABLED,
-    ytdlp_concurrent_fragments=YTDLP_CONCURRENT_FRAGMENTS,
-    ytdlp_retries=YTDLP_RETRIES,
-    ytdlp_http_chunk_size=YTDLP_HTTP_CHUNK_SIZE,
-    ytdlp_format=YTDLP_FORMAT,
-    pot_provider_url=YTDLP_POT_PROVIDER_URL,
-    proxy=YTDLP_PROXY,
     bot_pause_seconds=RSS_BOT_PAUSE_SECONDS,
     live_max_age_days=RSS_LIVE_MAX_AGE_DAYS,
     retry_max_age_days=RSS_RETRY_MAX_AGE_DAYS,
@@ -2003,8 +2048,8 @@ async def on_startup(app):
         rss_archiver.start()
         logger.info(
             "RSS-Archiv aktiviert (OPML: %s, Feed-URLs: %d, Feed-Filter: %s, Intervall: %ss, "
-            "Retries: %s, Retry-Backoff: %ss-%ss, Live-Recheck: %ss, yt-dlp-Fragmente: %d, "
-            "Cookies: %s, PO-Provider: %s).",
+            "Retries: %s, Retry-Backoff: %ss-%ss, Live-Recheck: %ss, Download: notube.cc "
+            "(Format: %s), Cookies: %s).",
             RSS_OPML_FILE or "-",
             len(RSS_FEED_URLS),
             ", ".join(RSS_FEED_TITLES) if RSS_FEED_TITLES else "alle Feeds",
@@ -2013,9 +2058,8 @@ async def on_startup(app):
             RSS_RETRY_BASE_SECONDS,
             RSS_RETRY_MAX_DELAY_SECONDS,
             RSS_LIVE_RECHECK_SECONDS,
-            YTDLP_CONCURRENT_FRAGMENTS,
-            YTDLP_COOKIES_FILE or "-",
-            YTDLP_POT_PROVIDER_URL or "-",
+            NOTUBE_FORMAT,
+            NOTUBE_COOKIES_FILE or "-",
         )
     else:
         logger.info("RSS-Archiv ist deaktiviert (RSS_ENABLED=false).")

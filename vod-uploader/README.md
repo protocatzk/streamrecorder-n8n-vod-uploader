@@ -54,8 +54,8 @@ unveraendert. API-Endpunkte (alle mit Dashboard-Session):
 ## rss.app-Archiv
 
 rss.app liefert in den Feeds nur Post-/Watch-URLs und Thumbnails, keine Videodateien.
-Der Bot loest die eigentliche Datei deshalb per `yt-dlp` auf (YouTube, X, TikTok,
-Instagram, Odysee, Rumble, ...) und nutzt danach die bestehende Pipeline:
+Der Bot loest die eigentliche Datei deshalb per `notube.cc` auf (YouTube, X,
+TikTok, Instagram, ...) und nutzt danach die bestehende Pipeline:
 Download, 1,8-GB-Split, Telegram-Upload, Forum-Topic.
 
 ### 1. OPML exportieren
@@ -131,13 +131,16 @@ wenn es ueber das Bundle `Gangstolking` gefunden wurde.
 | `RSS_TOPIC_PER_FEED` | `true` | Topic pro Quellkanal |
 | `RSS_ARCHIVE_CHAT_ID` | leer | Default: `TELEGRAM_CHAT_ID` |
 | `RSS_ARCHIVE_FORUM_CHAT_ID` | leer | Default: `TELEGRAM_FORUM_CHAT_ID` |
-| `YTDLP_COOKIES_FILE` | `/app/ytdlp/cookies.txt` | Netscape-Cookies fuer YouTube/X |
-| `YTDLP_POT_PROVIDER_URL` | `http://bgutil-provider:4416` | PO-Token-Provider (bgutil) |
-| `YTDLP_PROXY` | leer | Optionaler Proxy fuer yt-dlp |
-| `YTDLP_CONCURRENT_FRAGMENTS` | `4` | Parallele yt-dlp-Fragmente |
-| `YTDLP_RETRIES` | `10` | yt-dlp-Retries fuer Downloads |
-| `YTDLP_HTTP_CHUNK_SIZE` | `10485760` | HTTP-Chunk-Groesse in Bytes |
-| `YTDLP_FORMAT` | `bestvideo[height<=1080]+bestaudio/best` | Optionales Format-Limit |
+| `NOTUBE_COOKIES_FILE` | `/app/ytdlp/notube_cookies.txt` | notube-Cookies (Netscape, Header oder JSON) |
+| `NOTUBE_COOKIE` | leer | Alternativer Cookie-Header |
+| `NOTUBE_FORMAT` | `auto` | `mp42k` bei Plus, sonst `mp4hd` |
+| `NOTUBE_LANG` | `de` | Sprache der notube-Webseite |
+| `NOTUBE_SERVERS` | `40-76` | Serverpool |
+| `NOTUBE_REQUEST_TIMEOUT` | `3600` | Timeout fuer `recover_file`/Konvertierung (Sekunden) |
+| `NOTUBE_INACTIVITY_TIMEOUT` | `120` | Abbruch ohne Datenempfang (Sekunden) |
+| `NOTUBE_PROXY` | leer | Optionaler Proxy nur fuer notube |
+| `NOTUBE_CAPTCHA_PROVIDER` | leer | `2captcha` oder `capsolver` |
+| `NOTUBE_CAPTCHA_API_KEY` | leer | API-Key des Captcha-Dienstes |
 | `DOWNLOAD_CHUNK_SIZE` | `1048576` | Chunk-Groesse des direkten Downloaders |
 
 Der Erstlauf markiert die aktuell vorhandenen Items nur als gesehen. Ab dem
@@ -169,9 +172,10 @@ exponentiellem Backoff von 15 Minuten bis maximal 6 Stunden. Echte Dauerfehler
   irgendwann endgueltig auf.
 - **Live-Frist:** `RSS_LIVE_MAX_AGE_DAYS` (Default 7) beendet 24/7-Streams und
   Premieren, die nie als VOD verfuegbar werden.
-- **Bot-Check-Pause:** erkennt yt-dlp `Sign in to confirm you're not a bot`,
-  werden alle YouTube-Downloads fuer `RSS_BOT_PAUSE_SECONDS` (Default 1 h)
-  pausiert. Das verhindert eine Retry-Schleife, die die IP weiter auffaellt.
+- **Bot-Check-/Limit-Pause:** erkennt der Bot einen YouTube-Bot-Check oder ein
+  notube-Download-Limit, werden alle YouTube-Downloads fuer
+  `RSS_BOT_PAUSE_SECONDS` (Default 1 h) pausiert. Das verhindert eine
+  Retry-Schleife.
 
 Livestreams, Premieren und angekuendigte Streams bleiben als `live` in der
 Warteschlange. Sobald der Stream beendet und als VOD verfuegbar ist, wird er
@@ -184,29 +188,38 @@ Feed-Discovery und Verarbeitung sind getrennt: Der Poll liest die Feeds alle
 sequenziell. Ein mehrstuendiger Download blockiert dadurch nicht die Erkennung
 neuer Videos.
 
-### Downloadgeschwindigkeit
+### Download ueber notube.cc
 
-`YTDLP_CONCURRENT_FRAGMENTS` laedt mehrere Fragmente gleichzeitig und bringt bei
-YouTube/DASH/HLS den groessten Geschwindigkeitsgewinn. `YTDLP_FORMAT` kann
-zusaetzlich die Aufloesung begrenzen, wenn maximale Qualitaet nicht noetig ist:
+Der Download laeuft vollstaendig ueber notube.cc. Free-Konten liefern 1080p
+(`mp4hd`), mit Plus-Abo waehlt der Bot automatisch 2K (`mp42k`). Ausserdem
+gilt:
 
-```env
-YTDLP_FORMAT=bestvideo[height<=1080]+bestaudio/best
-```
+- Maximale Dateigroesse ca. 4 GB.
+- Download-Links laufen nach 20 Minuten ab; grosse Dateien werden daher
+  streamend geladen.
+- **Kein Resume:** notube ignoriert HTTP-Range. Bricht ein Download ab, startet
+  er beim naechsten Versuch bei 0. Der Job-State speichert trotzdem alle
+  bereits hochgeladenen Telegram-Teile.
+- Live-Streams unterstuetzt notube nicht. Sie bleiben im Retry-Backoff, bis der
+  Stream als VOD verfuegbar ist.
+- `recover_file.php` kann bei langen VODs mehrere Minuten blockieren; waehrend
+  dieser Phase zeigt das Dashboard noch keinen Byte-Fortschritt.
+- notube schuetzt `recover_file.php` mit **Cloudflare Turnstile**. Von
+  Server-/Datacenter-IPs erscheint dort ein Captcha; das passiert unabhaengig
+  von den Plus-Cookies. Loesungen:
+  - **Residential-Proxy** ueber `NOTUBE_PROXY` (empfohlen, verhindert das
+    Captcha meist).
+  - **Captcha-Solver** ueber `NOTUBE_CAPTCHA_PROVIDER=2captcha` bzw.
+    `capsolver` und `NOTUBE_CAPTCHA_API_KEY`.
+  - Ohne beides pausiert der Bot Captcha-Items fuer `RSS_BOT_PAUSE_SECONDS`
+    und versucht es spaeter erneut.
 
-### 5. Cookies und PO-Token-Provider
+### 5. notube-Cookies (Plus)
 
-YouTube blockt Server-/Datacenter-IPs regelmaessig mit
-`Sign in to confirm you're not a bot`. Der Uploader kombiniert deshalb zwei
-Dinge:
-
-1. **Cookies** von einem Wegwerf-Google-Account (Netscape-Format).
-2. **PO-Token-Provider** (`bgutil-ytdlp-pot-provider`) als eigener Compose-Service.
-
-Cookies ablegen unter `vod-uploader/ytdlp/cookies.txt`. Das Verzeichnis ist in
-`docker-compose.yml` read-only nach `/app/ytdlp` gemountet. yt-dlp arbeitet mit
-einer schreibbaren Temp-Kopie, damit die Originaldatei durch Cookie-Rotation
-nicht veraendert wird:
+Ein Plus-Abo wird automatisch ueber die notube-Session erkannt
+(`check_subscription.php`). Die Cookies liegen unter
+`vod-uploader/ytdlp/notube_cookies.txt` und werden in `docker-compose.yml`
+read-only nach `/app/ytdlp` gemountet:
 
 ```yaml
 volumes:
@@ -214,40 +227,32 @@ volumes:
 ```
 
 ```env
-YTDLP_COOKIES_FILE=/app/ytdlp/cookies.txt
-YTDLP_POT_PROVIDER_URL=http://bgutil-provider:4416
+NOTUBE_COOKIES_FILE=/app/ytdlp/notube_cookies.txt
+NOTUBE_FORMAT=auto
 ```
 
-**Cookies im laufenden Betrieb austauschen:** einfach
-`vod-uploader/ytdlp/cookies.txt` auf dem Host ersetzen. yt-dlp liest die Datei
-bei jedem Download/Probe neu; ein Neustart oder Rebuild ist nicht noetig.
-Danach im Dashboard **Retries zurücksetzen** druecken (oder
-`POST /voduploader/api/rss/retry`), damit die wartenden Items sofort erneut
-versucht werden.
+Unterstuetzte Formate:
+
+- **Netscape-Cookie-Datei** (`# Netscape HTTP Cookie File`), z. B. Export aus
+  einer Browser-Erweiterung.
+- Roher `Cookie:`-Header.
+- JSON-Export.
+
+Es werden nur Cookies fuer `notube.cc` bzw. `.notube.cc` verwendet und an
+`notube.cc` sowie `s*.notube.cc` gesendet.
+
+**Cookies im laufenden Betrieb austauschen:** einfach die Datei auf dem Host
+ersetzen. Der Bot liest sie bei jeder Anfrage neu; ein Neustart oder Rebuild
+ist nicht noetig. Danach im Dashboard **Retries zurücksetzen** druecken (oder
+`POST /voduploader/api/rss/retry`).
 
 Hinweise:
 
-- Nur YouTube-Cookies in der Datei lassen (`.youtube.com`), keine Session-Cookies
-  von Banking, PayPal o. ae. Die Datei ist per `.gitignore` ausgeschlossen.
-- `chmod 600 vod-uploader/ytdlp/cookies.txt`.
-- Der PO-Provider laeuft nur im internen Docker-Netz (kein `ports:`-Mapping).
-- Reicht beides nicht (IP hart geblockt), kann `YTDLP_PROXY` auf einen
-  Residential-Proxy zeigen.
-
-**Wenn die Cookies nicht mehr funktionieren:**
-
-Das Dashboard zeigt dann `COOKIES UNGÜLTIG` (oder `YOUTUBE BLOCKIERT`). Die
-wichtigsten Auth-Cookies pruefen (Werte werden nicht angezeigt):
-
-```bash
-grep -oP '\t\K(SID|HSID|SSID|APISID|SAPISID|__Secure-1PSID|__Secure-3PSID|LOGIN_INFO)(?=\t)' \
-  vod-uploader/ytdlp/cookies.txt | sort -u
-```
-
-Fehlen `SID`, `HSID`, `SSID`, `APISID` oder `SAPISID`, ist der Export unvollstaendig
-oder die Session wurde von Google beendet. Dann neu exportieren, Datei
-ersetzen und **Retries zurücksetzen** druecken. Die Originaldatei wird von
-yt-dlp nicht mehr beschrieben (Temp-Kopie), kann also gefahrlos getauscht werden.
+- `chmod 600 vod-uploader/ytdlp/notube_cookies.txt`.
+- Die Datei ist per `.gitignore` ausgeschlossen und gehoert nicht ins Repo.
+- Das Dashboard zeigt `NOTUBE PLUS`, `NOTUBE FREE` oder `NOTUBE COOKIE FEHLT`.
+- Bei abgelaufener Session liefert notube nur noch 1080p. Neue Cookies
+  exportieren, Datei ersetzen, **Retries zurücksetzen**.
 
 ### 6. Start
 
@@ -308,7 +313,7 @@ aktiven Job bzw. `✕` in der Warteschlange). Der Endpunkt
 - Wartende Jobs werden sofort aus der Queue entfernt, ohne den laufenden Job zu
   beeinflussen.
 - Laufende Jobs brechen an kooperativen Checkpoints ab (Download-Chunks,
-  yt-dlp-Fortschritt, ffmpeg-Split, Upload-Chunks). Greift das nicht, wird der
+  notube-Fortschritt, ffmpeg-Split, Upload-Chunks). Greift das nicht, wird der
   Task nach `JOB_CANCEL_FORCE_AFTER_SECONDS` (Standard `30`) hart beendet.
 - Bereits nach Telegram gesendete Teile werden wieder geloescht.
 - Der Job wird **nicht** als abgeschlossen gespeichert und nach einem Neustart
@@ -332,7 +337,9 @@ landen.
   zeigt die geladenen Feed-Titel und den OPML-Status.
 - `Feed nicht lesbar`: rss.app liefert die XML-Datei nicht. Feed im rss.app
   Dashboard oeffnen und den XML-Link pruefen.
-- yt-dlp-Fehler: Im Container sind `ffmpeg` und `deno` installiert; yt-dlp laedt
-  den YouTube-Challenge-Solver bei Bedarf von GitHub (`ejs:github`).
+- notube-Fehler: `NOTUBE COOKIE FEHLT` bedeutet, dass
+  `vod-uploader/ytdlp/notube_cookies.txt` fehlt oder leer ist. Bei
+  `NOTUBE FREE` trotz Plus-Abo die Session-Cookies neu exportieren. Timeouts
+  bei sehr langen VODs ueber `NOTUBE_REQUEST_TIMEOUT` erhoehen.
 - Nichts wird nach dem Erstlauf archiviert: Der Erstlauf ist absichtlich eine
   Baseline. Neues Video posten und `POST /rss/check` ausloesen.
