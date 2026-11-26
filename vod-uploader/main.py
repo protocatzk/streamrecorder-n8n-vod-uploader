@@ -68,6 +68,8 @@ TARGET_PART_SIZE_BYTES = int(1.4 * 1024 * 1024 * 1024)  # 1.4 GB = 1.503.238.553
 PARALLEL_WORKERS = int(os.getenv('PARALLEL_UPLOAD_WORKERS', '3'))
 FFMPEG_THREADS = int(os.getenv('FFMPEG_THREADS', '2'))
 ALLOWED_DASHBOARD_USERS = os.getenv('ALLOWED_DASHBOARD_USERS', '@Ripperchieff,@x42067')
+ALERT_CHAT_ID = os.getenv('ALERT_CHAT_ID', '').strip() or None
+ALERT_COOLDOWN_SECONDS = max(60, int(os.getenv('ALERT_COOLDOWN_SECONDS', '21600')))
 DOWNLOAD_INACTIVITY_TIMEOUT = int(os.getenv('DOWNLOAD_INACTIVITY_TIMEOUT', '120'))
 DOWNLOAD_CHUNK_SIZE = max(64 * 1024, int(os.getenv('DOWNLOAD_CHUNK_SIZE', str(1024 * 1024))))
 
@@ -205,6 +207,7 @@ class BotState:
         self.job_cancel_requested: dict[str, float] = {}
         self.job_cancel_timers: dict[str, asyncio.Task] = {}
         self.cancelled_jobs: dict[str, float] = {}
+        self.alert_cooldowns: dict[str, float] = {}
         self.shutting_down: bool = False
 
 state = BotState()
@@ -224,6 +227,39 @@ def is_cancel_requested(key: str) -> bool:
 def raise_if_cancelled(key: str) -> None:
     if key in state.job_cancel_requested:
         raise JobCancelled("Job wurde manuell abgebrochen.")
+
+
+async def send_cookie_alert(alert_key: str, title: str, details: str = "") -> bool:
+    """Sendet eine deduplizierte Telegram-Warnung bei Cookie-/Auth-Fehlern."""
+    now = time.time()
+    last_sent = state.alert_cooldowns.get(alert_key, 0.0)
+    if now - last_sent < ALERT_COOLDOWN_SECONDS:
+        return False
+    if state.telegram_client is None:
+        return False
+
+    targets = (
+        [ALERT_CHAT_ID]
+        if ALERT_CHAT_ID
+        else [u.strip() for u in ALLOWED_DASHBOARD_USERS.split(',') if u.strip()]
+    )
+    if not targets:
+        return False
+
+    state.alert_cooldowns[alert_key] = now
+    msg = f"⚠️ <b>{escape_html(title)}</b>"
+    if details:
+        msg += f"\n\n<code>{escape_html(str(details)[:600])}</code>"
+
+    sent_any = False
+    for target in targets:
+        try:
+            ref = int(target) if str(target).lstrip('-').isdigit() else target
+            await state.telegram_client.send_message(ref, msg, parse_mode='html')
+            sent_any = True
+        except Exception as exc:
+            logger.warning(f"Konnte Cookie-Alert an '{target}' nicht senden: {exc}")
+    return sent_any
 
 
 def remember_cancelled(key: str) -> None:
@@ -944,6 +980,16 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
 
                     # Transienter Fehler: Job-Verzeichnis behalten. notube kann
                     # nicht fortsetzen, der Range-Downloader dagegen schon.
+                    err_text = str(dl_err)
+                    if (
+                        "streamrecorder" in str(download_url).lower()
+                        and any(code in err_text for code in ("401", "403", "HTTP 401", "HTTP 403"))
+                    ):
+                        await send_cookie_alert(
+                            f"streamrecorder:{streamer}",
+                            "Streamrecorder-Cookie abgelaufen",
+                            f"Streamer: {streamer}\nDownload-Fehler: {err_text[:250]}",
+                        )
                     keep_files = True
                     try:
                         JOB_STORE.fail(key, str(dl_err))
@@ -1242,6 +1288,12 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                         async with session.get(mark_url, headers=headers) as mark_resp:
                             resp_text = await mark_resp.text()
                             logger.info(f"[{job_id}] Streamrecorder Auto-Mark: HTTP {mark_resp.status} (Antwort: {resp_text[:100]})")
+                            if mark_resp.status in (401, 403) or "login" in resp_text.lower() or "unauthorized" in resp_text.lower():
+                                await send_cookie_alert(
+                                    f"streamrecorder:{streamer}",
+                                    "Streamrecorder-Cookie abgelaufen",
+                                    f"Streamer: {streamer}\nsetdownloaded HTTP {mark_resp.status}: {resp_text[:150]}",
+                                )
                 except Exception as e:
                     logger.warning(f"[{job_id}] Konnte Streamrecorder nicht als downloaded markieren: {e}")
 
@@ -1448,7 +1500,72 @@ rss_archiver = RssArchiver(
     live_max_age_days=RSS_LIVE_MAX_AGE_DAYS,
     retry_max_age_days=RSS_RETRY_MAX_AGE_DAYS,
     max_retries_per_poll=RSS_MAX_RETRIES_PER_POLL,
+    on_cookie_alert=send_cookie_alert,
 )
+
+
+async def handle_cookie_alert(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    alert_key = str(data.get("key") or "manual").strip()
+    title = str(data.get("title") or "Cookie-Warnung").strip()
+    details = str(data.get("details") or "").strip()
+    sent = await send_cookie_alert(alert_key, title, details)
+    return web.json_response({"status": "ok", "sent": sent})
+
+
+STREAMRECORDER_COOKIE_FILES = {
+    "ripperchieff": "streamrecorder.io ripperchieff.txt",
+    "karpfenchieff": "streamrecorder karpfenchieff.txt",
+    "karbfenchieff": "streamrecorder.io_ karbfenchieff.txt",
+}
+
+
+def _read_netscape_cookie_header(file_path: str) -> str:
+    pairs = []
+    with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw_line in fh:
+            line = raw_line.rstrip("\r\n")
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and parts[5].strip():
+                pairs.append(f"{parts[5].strip()}={parts[6]}")
+    return "; ".join(pairs)
+
+
+async def handle_streamrecorder_cookie(request):
+    account = (request.query.get("account") or "").strip().lower()
+    if account not in STREAMRECORDER_COOKIE_FILES:
+        return web.json_response(
+            {"error": f"Unknown account '{account}'. Valid: {list(STREAMRECORDER_COOKIE_FILES)}"},
+            status=400,
+        )
+    try:
+        limit = max(1, min(100, int(request.query.get("limit", "10"))))
+    except ValueError:
+        limit = 10
+
+    ytdlp_dir = os.path.dirname(NOTUBE_COOKIES_FILE) or "/app/ytdlp"
+    filename = STREAMRECORDER_COOKIE_FILES[account]
+    cookie_path = os.path.join(ytdlp_dir, filename)
+    if not os.path.exists(cookie_path):
+        return web.json_response({"error": f"Cookie file not found: {filename}"}, status=404)
+
+    cookie_str = _read_netscape_cookie_header(cookie_path)
+    if not cookie_str:
+        return web.json_response({"error": f"No cookies parsed from {filename}"}, status=422)
+
+    return web.json_response(
+        {
+            "account": account,
+            "cookie": cookie_str,
+            "limit": limit,
+            "file": filename,
+        }
+    )
 
 
 async def handle_rss_status(request):
@@ -2175,6 +2292,8 @@ def create_app():
     app = web.Application()
     app.router.add_post('/upload', handle_upload)
     app.router.add_get('/health', handle_health)
+    app.router.add_post('/alerts/cookie', handle_cookie_alert)
+    app.router.add_get('/cookies/streamrecorder', handle_streamrecorder_cookie)
     app.router.add_post('/rss/check', handle_rss_check)
     app.router.add_get('/rss/status', handle_rss_status)
     app.router.add_post('/rss/backfill', handle_rss_backfill)

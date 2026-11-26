@@ -336,8 +336,10 @@ class RssArchiver:
         live_max_age_days: int = 7,
         retry_max_age_days: int = 30,
         max_retries_per_poll: int = 3,
+        on_cookie_alert=None,
     ):
         self.on_item = on_item
+        self.on_cookie_alert = on_cookie_alert
         self.enabled = enabled
         self.state_file = state_file
         self.opml_file = opml_file
@@ -1470,8 +1472,26 @@ class RssArchiver:
                     pause_label,
                     self.bot_pause_seconds,
                 )
+                if self.on_cookie_alert:
+                    try:
+                        await self.on_cookie_alert(
+                            "notube_bot_check",
+                            "notube-Cookies / Bot-Check",
+                            f"{pause_label} (Pause {self.bot_pause_seconds}s): {reason}",
+                        )
+                    except Exception:
+                        pass
             self.last_error = f"{pause_label}: {reason}"[:500]
             reason = f"{pause_label}: {reason}"
+        elif reason.startswith("Altersbeschraenkt") and self.on_cookie_alert:
+            try:
+                await self.on_cookie_alert(
+                    "notube_age_restricted",
+                    "notube-Cookies (Altersbeschränkung)",
+                    reason,
+                )
+            except Exception:
+                pass
         attempts = self._attempts(item.key) + 1
         next_retry = 0
         if self.max_retries and attempts >= self.max_retries:

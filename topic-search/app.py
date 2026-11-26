@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,28 @@ def _pick_display_name(aliases: list[str]) -> str:
     if handles:
         return handles[0]
     return sorted(aliases, key=lambda x: (len(x), x.lower()))[0]
+
+
+def _clean_display_aliases(display_name: str, aliases: list[str]) -> list[str]:
+    """Entfernt den Haupttitel sowie normalisierte Duplikate aus der Alias-Anzeige."""
+    seen: set[str] = {normalize_key(display_name)}
+    cleaned: list[str] = []
+    for alias in aliases:
+        norm = normalize_key(alias)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        cleaned.append(alias)
+    return cleaned
+
+
+def _iso_to_epoch(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
 
 
 class SearchIndex:
@@ -103,10 +126,11 @@ class SearchIndex:
             unique_aliases = list(dict.fromkeys(a for a in aliases if a))
             if not unique_aliases:
                 continue
+            display_name = _pick_display_name(unique_aliases)
             topics[tid] = {
                 "topic_id": tid,
-                "display_name": _pick_display_name(unique_aliases),
-                "aliases": unique_aliases,
+                "display_name": display_name,
+                "aliases": _clean_display_aliases(display_name, unique_aliases),
                 "norm_aliases": [(a.lower(), normalize_key(a)) for a in unique_aliases],
                 "topic_url": build_topic_url(tid),
             }
@@ -210,12 +234,18 @@ class SearchIndex:
         q_raw = (query or "").strip().lower()
         q_norm = normalize_key(q_raw)
 
-        scored: list[tuple[tuple[int, int, str], dict[str, Any]]] = []
+        scored: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
         for tid, topic in self._topics.items():
             if not q_raw:
                 vods = self._vods_by_topic.get(tid, [])
-                # Ohne Suchbegriff: Topics mit VODs zuerst, dann alphabetisch
-                score = (0 if vods else 1, -len(vods), topic["display_name"].lower())
+                # Ohne Suchbegriff: Topics mit dem neuesten VOD ganz oben, dann alphabetisch
+                if vods:
+                    newest = vods[0]
+                    newest_ts = _iso_to_epoch(newest.get("finished_at") or newest.get("recorded_at") or "")
+                    newest_mid = int(newest.get("message_id") or 0)
+                    score = (0, -newest_ts, -newest_mid, topic["display_name"].lower())
+                else:
+                    score = (1, 0.0, 0, topic["display_name"].lower())
                 scored.append((score, topic))
                 continue
 
