@@ -51,6 +51,7 @@ class JobStore:
         self.jobs_dir = os.path.join(self.base_dir, "jobs")
         self.jobs_file = os.path.join(self.base_dir, "jobs.json")
         self.done_file = os.path.join(self.base_dir, "done.json")
+        self.vod_index_file = os.path.join(self.base_dir, "vod_index.jsonl")
         self.done_ttl = max(1, done_ttl_days) * 86400
         self.stale_seconds = max(1, stale_days) * 86400
         self.failed_ttl = max(1, failed_ttl_days) * 86400
@@ -167,6 +168,18 @@ class JobStore:
             self._done[key] = time.time()
             self._save_done()
         self.remove_job_dir(key)
+
+    def append_vod_index(self, entry: Dict[str, Any]) -> None:
+        """Schreibt einen abgeschlossenen Forum-Upload in den persistenten VOD-Suchindex."""
+        try:
+            payload = dict(entry)
+            payload.setdefault("finished_at", utcnow())
+            line = json.dumps(payload, ensure_ascii=False)
+            with open(self.vod_index_file, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+                fh.flush()
+        except Exception:
+            pass
 
     def fail(self, key: str, error: str) -> None:
         self.update(key, status="failed", error=str(error)[:1000])

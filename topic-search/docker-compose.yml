@@ -1,0 +1,23 @@
+services:
+  topic_search:
+    build: .
+    container_name: topic_search
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      - PORT=8081
+      - TELEGRAM_CHANNEL_USERNAME=${TELEGRAM_CHANNEL_USERNAME:-RippersArchiv}
+      - FORUM_CHAT_ID=${FORUM_CHAT_ID:--1004489497092}
+      - TOPICS_CACHE_FILE=/data/topics_cache.json
+      - VOD_INDEX_FILE=/data/state/vod_index.jsonl
+      - JOBS_FILE=/data/state/jobs.json
+      - MAX_VODS_PER_TOPIC=3
+    volumes:
+      - ../vod-uploader/topics_cache.json:/data/topics_cache.json:ro
+      - ../vod-uploader/state_data:/data/state:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M

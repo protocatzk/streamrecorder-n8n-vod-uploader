@@ -1261,6 +1261,23 @@ async def process_job(data: dict, job_key: str | None = None) -> tuple[dict, int
                 })
                 state.active_job = None
 
+            if target_topic_id and forum_message_ids:
+                JOB_STORE.append_vod_index({
+                    "key": key,
+                    "job_id": job_id,
+                    "forum_chat_id": str(forum_chat_id),
+                    "topic_id": int(target_topic_id),
+                    "message_id": int(forum_message_ids[0]),
+                    "message_ids": [int(m) for m in forum_message_ids],
+                    "streamer": streamer,
+                    "topic_name": topic_title if 'topic_title' in locals() else streamer,
+                    "title": title,
+                    "platform": platform,
+                    "duration": duration,
+                    "size_mb": actual_size_mb,
+                    "recorded_at": recorded_at,
+                })
+
             JOB_STORE.complete(key)
             return {
                 "status": "success",
